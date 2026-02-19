@@ -1,0 +1,25 @@
+[project]
+name = "hail"
+version = "0.1.0"
+description = "Automated Polymarket short-horizon trader"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "aiosqlite>=0.21.0",
+  "httpx>=0.28.1",
+  "pydantic>=2.11.7",
+  "pydantic-settings>=2.10.1",
+  "py-clob-client>=0.34.5",
+  "python-dotenv>=1.1.1",
+  "websockets>=15.0.1",
+]
+
+[project.scripts]
+hail-bot = "hail.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hail"]

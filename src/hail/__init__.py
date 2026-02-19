@@ -1,0 +1,1 @@
+"""Hail trading bot package."""
