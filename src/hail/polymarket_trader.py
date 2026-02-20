@@ -14,10 +14,10 @@ from py_clob_client.order_builder.constants import BUY, SELL
 class PolymarketTrader:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._client: Any | None = None
-        self._buy_side: Any | None = None
-        self._sell_side: Any | None = None
-        self._order_args_cls: Any | None = None
+        self._client: ClobClient | None = None
+        self._buy_side: str | None = None
+        self._sell_side: str | None = None
+        self._order_args_cls: OrderArgs | None = None
 
     async def connect(self) -> None:
         self._buy_side = BUY
@@ -31,7 +31,7 @@ class PolymarketTrader:
             signature_type=self._settings.poly_signature_type,
             funder=self._settings.funder_address,
         )
-        creds = await temp_client.create_or_derive_api_key()
+        creds = await temp_client.create_or_derive_api_creds()
         self._client = ClobClient(
             self._settings.poly_host,
             chain_id=self._settings.poly_chain_id,
