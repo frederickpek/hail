@@ -48,6 +48,42 @@ uv run hail-bot
 - **Hedge**: If holding one side, buy opposite side if combined cost leaves at least
   `MIN_HEDGE_MARGIN` against a complete-set payout of `1.0`.
 
+## Main Strategy Flow
+
+```mermaid
+flowchart TD
+    A[Scan Polymarket Gamma for target BTC/ETH/SOL 5m/15m markets]
+    B[Subscribe to Polymarket YES/NO order book tops]
+    C[Stream Binance mid prices and estimate annualized vol]
+    D{For each active market}
+    E[Compute fair YES probability from spot, strike, time-to-expiry, vol]
+    F[Persist quote snapshot to SQLite]
+    G[Load local position state]
+    H[Generate intents]
+    I{Entry edge met?}
+    J[BUY YES or BUY NO]
+    K{Profitable exit edge met?}
+    L[SELL held side]
+    M{Hedge condition met?}
+    N[BUY opposite side to form cheaper complete set]
+    O{Any intents created?}
+    P[Execute only first intent this pass]
+    Q[Record intent status + optimistically update local position]
+    R[Persist position and PnL snapshot]
+    S[Sleep 2s and repeat decision loop]
+
+    A --> B --> C --> D --> E --> F --> G --> H
+    H --> I
+    I -- yes --> J --> O
+    I -- no --> K
+    K -- yes --> L --> O
+    K -- no --> M
+    M -- yes --> N --> O
+    M -- no --> O
+    O -- yes --> P --> Q --> R --> S --> D
+    O -- no --> R --> S --> D
+```
+
 ## Important Notes
 
 - This bot updates positions optimistically on posted orders. For production use, add
