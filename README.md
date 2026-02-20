@@ -14,7 +14,7 @@ Automated Polymarket trading bot for short-horizon crypto binary markets (5m/15m
   - opposite-side hedge opportunities.
 - Persists markets, quotes, intents, positions, and PnL snapshots to SQLite.
 - Sends periodic Telegram PnL summaries.
-- Uses daily rotating logs with 3 days retention in `/logs`.
+- Uses daily rotating logs with 3 days retention in `./logs`.
 
 ## Setup (uv)
 
@@ -32,8 +32,8 @@ uv sync
 
 3. Ensure writable directories exist:
 
-- `/logs` for logs
-- `/data` for SQLite database
+- `./logs` for logs
+- `./data` for SQLite database
 
 4. Run:
 

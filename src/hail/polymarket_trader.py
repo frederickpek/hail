@@ -31,7 +31,7 @@ class PolymarketTrader:
             signature_type=self._settings.poly_signature_type,
             funder=self._settings.funder_address,
         )
-        creds = await temp_client.create_or_derive_api_creds()
+        creds = temp_client.create_or_derive_api_creds()
         self._client = ClobClient(
             self._settings.poly_host,
             chain_id=self._settings.poly_chain_id,

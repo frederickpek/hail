@@ -8,14 +8,22 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        enable_decoding=False,
+    )
 
     private_key: str = Field(alias="PRIVATE_KEY")
     funder_address: str | None = Field(default=None, alias="FUNDER_ADDRESS")
     poly_signature_type: int = Field(default=0, alias="POLY_SIGNATURE_TYPE")
     poly_chain_id: int = Field(default=137, alias="POLY_CHAIN_ID")
     poly_host: str = Field(default="https://clob.polymarket.com", alias="POLY_HOST")
-    poly_ws_url: str = Field(default="wss://clob.polymarket.com/ws/market", alias="POLY_WS_URL")
+    poly_ws_url: str = Field(
+        default="wss://ws-subscriptions-clob.polymarket.com/ws/market",
+        alias="POLY_WS_URL",
+    )
     gamma_api_url: str = Field(default="https://gamma-api.polymarket.com", alias="GAMMA_API_URL")
     binance_ws_url: str = Field(default="wss://stream.binance.com:9443/ws", alias="BINANCE_WS_URL")
 
@@ -34,9 +42,9 @@ class Settings(BaseSettings):
     telegram_report_interval_seconds: int = Field(default=300, alias="TELEGRAM_REPORT_INTERVAL_SECONDS")
 
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
-    log_dir: str = Field(default="/logs", alias="LOG_DIR")
+    log_dir: str = Field(default="logs", alias="LOG_DIR")
     log_file: str = Field(default="trader.log", alias="LOG_FILE")
-    data_dir: str = Field(default="/data", alias="DATA_DIR")
+    data_dir: str = Field(default="data", alias="DATA_DIR")
     db_name: str = Field(default="hail.db", alias="DB_NAME")
     request_timeout_seconds: float = Field(default=15.0, alias="REQUEST_TIMEOUT_SECONDS")
 

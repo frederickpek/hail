@@ -16,7 +16,7 @@ def setup_logging(settings: Settings) -> None:
     root.handlers.clear()
 
     formatter = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        fmt="%(asctime)s - %(levelname)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
@@ -33,6 +33,10 @@ def setup_logging(settings: Settings) -> None:
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
     root.addHandler(console_handler)
+
+    # Reduce noisy per-request logs from third-party HTTP clients.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def _ensure_parent(path: Path) -> None:
