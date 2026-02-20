@@ -23,6 +23,11 @@ class ProbabilityModel:
         end_time: datetime,
         annual_vol: float,
     ) -> float:
+        if strike <= 0:
+            # Up/Down contracts may not expose an explicit strike in API payloads.
+            # Use a neutral prior until a concrete strike source is wired in.
+            return 0.5
+
         now = datetime.now(tz=timezone.utc)
         seconds = max((end_time - now).total_seconds(), 1.0)
         tau = seconds / (365.0 * 24.0 * 3600.0)

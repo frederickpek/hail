@@ -28,6 +28,8 @@ class TradingEngine:
         self._states: dict[str, MarketState] = {}
         self._positions: dict[str, PositionState] = {}
         self._token_to_market: dict[str, tuple[str, str]] = {}
+        self._scan_tick = 0
+        self._decision_tick = 0
 
         self._book_feed = PolymarketBookFeed(settings, self._on_book_update)
 
@@ -73,22 +75,43 @@ class TradingEngine:
     async def _scan_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
+                self._scan_tick += 1
                 markets = await self._scanner.scan()
-                await self._register_markets(markets)
+                stats = await self._register_markets(markets)
+                logging.info(
+                    (
+                        "scan-loop tick=%s fetched=%s active=%s new=%s refreshed=%s "
+                        "expired_skipped=%s removed=%s subscribed_assets=%s tracked_tokens=%s"
+                    ),
+                    self._scan_tick,
+                    stats["fetched"],
+                    stats["active"],
+                    stats["new"],
+                    stats["refreshed"],
+                    stats["expired_skipped"],
+                    stats["removed"],
+                    stats["subscribed_assets"],
+                    stats["tracked_tokens"],
+                )
             except Exception as exc:  # noqa: BLE001
                 logging.warning("scan loop error: %s", exc)
             await asyncio.sleep(self._settings.scan_interval_seconds)
 
-    async def _register_markets(self, markets: list[MarketDefinition]) -> None:
+    async def _register_markets(self, markets: list[MarketDefinition]) -> dict[str, int]:
         token_ids: list[str] = []
         now = datetime.now(tz=timezone.utc)
         active_condition_ids = set()
+        new_count = 0
+        refreshed_count = 0
+        expired_skipped_count = 0
         for market in markets:
             if market.end_time <= now:
+                expired_skipped_count += 1
                 continue
             active_condition_ids.add(market.condition_id)
             if market.condition_id not in self._states:
                 self._states[market.condition_id] = MarketState(market=market)
+                new_count += 1
                 logging.info(
                     "New target market: %s %s %s",
                     market.symbol,
@@ -97,6 +120,7 @@ class TradingEngine:
                 )
             else:
                 self._states[market.condition_id].market = market
+                refreshed_count += 1
 
             self._token_to_market[market.yes_token_id] = (market.condition_id, "YES")
             self._token_to_market[market.no_token_id] = (market.condition_id, "NO")
@@ -114,23 +138,57 @@ class TradingEngine:
         for condition_id in to_remove:
             self._states.pop(condition_id, None)
             self._positions.pop(condition_id, None)
+        return {
+            "fetched": len(markets),
+            "active": len(active_condition_ids),
+            "new": new_count,
+            "refreshed": refreshed_count,
+            "expired_skipped": expired_skipped_count,
+            "removed": len(to_remove),
+            "subscribed_assets": len(set(token_ids)),
+            "tracked_tokens": len(self._token_to_market),
+        }
 
     async def _decision_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
-                await self._evaluate_all_markets()
+                self._decision_tick += 1
+                stats = await self._evaluate_all_markets()
+                if stats["intents_executed"] > 0 or self._decision_tick % 30 == 0:
+                    logging.info(
+                        (
+                            "decision-loop tick=%s states=%s evaluated=%s skipped_expired=%s "
+                            "skipped_no_spot=%s intents_created=%s intents_executed=%s"
+                        ),
+                        self._decision_tick,
+                        stats["states"],
+                        stats["evaluated"],
+                        stats["skipped_expired"],
+                        stats["skipped_no_spot"],
+                        stats["intents_created"],
+                        stats["intents_executed"],
+                    )
             except Exception as exc:  # noqa: BLE001
                 logging.exception("decision loop error: %s", exc)
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
 
-    async def _evaluate_all_markets(self) -> None:
+    async def _evaluate_all_markets(self) -> dict[str, int]:
         now = datetime.now(tz=timezone.utc)
+        states_count = len(self._states)
+        evaluated_count = 0
+        skipped_expired_count = 0
+        skipped_no_spot_count = 0
+        intents_created_count = 0
+        intents_executed_count = 0
         for condition_id, state in list(self._states.items()):
             if state.market.end_time <= now:
+                skipped_expired_count += 1
                 continue
             spot = self._binance.get_mid(state.market.symbol)
             if spot is None:
+                skipped_no_spot_count += 1
                 continue
+            evaluated_count += 1
 
             fallback_vol = self._settings.annual_vol_by_symbol.get(state.market.symbol, 0.8)
             annual_vol = self._binance.get_annualized_vol(state.market.symbol, fallback=fallback_vol)
@@ -149,9 +207,11 @@ class TradingEngine:
 
             position = await self._get_position(condition_id)
             intents = self._strategy.generate_intents(state, position)
+            intents_created_count += len(intents)
             if intents:
                 # Prevent overtrading in a single decision pass.
                 await self._execute_intent(intents[0], state.market)
+                intents_executed_count += 1
 
             unrealized = mark_to_market_unrealized(state, position)
             await self._db.record_pnl(
@@ -165,6 +225,14 @@ class TradingEngine:
                     "spot": spot,
                 },
             )
+        return {
+            "states": states_count,
+            "evaluated": evaluated_count,
+            "skipped_expired": skipped_expired_count,
+            "skipped_no_spot": skipped_no_spot_count,
+            "intents_created": intents_created_count,
+            "intents_executed": intents_executed_count,
+        }
 
     async def _execute_intent(self, intent: TradeIntent, market: MarketDefinition) -> None:
         await self._db.record_intent(intent, status="PENDING")
