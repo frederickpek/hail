@@ -10,6 +10,7 @@ class TelegramNotifier:
     def __init__(self, settings: Settings) -> None:
         self._token = settings.telegram_bot_token
         self._chat_id = settings.telegram_chat_id
+        self._thread_id = settings.telegram_thread_id
         self._timeout = settings.request_timeout_seconds
 
     @property
@@ -21,6 +22,8 @@ class TelegramNotifier:
             return
         url = f"https://api.telegram.org/bot{self._token}/sendMessage"
         payload = {"chat_id": self._chat_id, "text": message}
+        if self._thread_id is not None:
+            payload["message_thread_id"] = self._thread_id
         timeout = httpx.Timeout(self._timeout)
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:

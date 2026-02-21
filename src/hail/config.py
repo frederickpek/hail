@@ -15,8 +15,11 @@ class Settings(BaseSettings):
         enable_decoding=False,
     )
 
-    private_key: str = Field(alias="PRIVATE_KEY")
+    private_key: str | None = Field(default=None, alias="PRIVATE_KEY")
     funder_address: str | None = Field(default=None, alias="FUNDER_ADDRESS")
+    poly_api_key: str | None = Field(default=None, alias="POLY_API_KEY")
+    poly_api_secret: str | None = Field(default=None, alias="POLY_API_SECRET")
+    poly_api_passphrase: str | None = Field(default=None, alias="POLY_API_PASSPHRASE")
     poly_signature_type: int = Field(default=0, alias="POLY_SIGNATURE_TYPE")
     poly_chain_id: int = Field(default=137, alias="POLY_CHAIN_ID")
     poly_host: str = Field(default="https://clob.polymarket.com", alias="POLY_HOST")
@@ -39,6 +42,7 @@ class Settings(BaseSettings):
 
     telegram_bot_token: str | None = Field(default=None, alias="TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str | None = Field(default=None, alias="TELEGRAM_CHAT_ID")
+    telegram_thread_id: int | None = Field(default=None, alias="TELEGRAM_HAIL_THREAD_ID")
     telegram_report_interval_seconds: int = Field(default=300, alias="TELEGRAM_REPORT_INTERVAL_SECONDS")
 
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")

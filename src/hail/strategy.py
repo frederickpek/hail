@@ -24,9 +24,7 @@ class ProbabilityModel:
         annual_vol: float,
     ) -> float:
         if strike <= 0:
-            # Up/Down contracts may not expose an explicit strike in API payloads.
-            # Use a neutral prior until a concrete strike source is wired in.
-            return 0.5
+            raise ValueError("Missing/invalid strike: cannot compute fair probability")
 
         now = datetime.now(tz=timezone.utc)
         seconds = max((end_time - now).total_seconds(), 1.0)
@@ -69,6 +67,7 @@ class Strategy:
         condition_id = market.market.condition_id
         size = self._settings.default_order_size
         max_pos = self._settings.max_position_per_market
+        model_note = self._model_note_for_market(market)
 
         # Entry logic.
         if yes_ask is not None and (fair_yes - yes_ask) >= self._settings.min_entry_edge:
@@ -80,7 +79,14 @@ class Strategy:
                         side="BUY",
                         price=yes_ask,
                         size=min(size, max_pos - position.qty_yes),
-                        reason=f"ENTRY_YES edge={fair_yes - yes_ask:.4f}",
+                        reason=self._entry_reason(
+                            outcome="YES",
+                            fair=fair_yes,
+                            ask=yes_ask,
+                            edge=fair_yes - yes_ask,
+                            threshold=self._settings.min_entry_edge,
+                            model_note=model_note,
+                        ),
                     )
                 )
 
@@ -93,7 +99,14 @@ class Strategy:
                         side="BUY",
                         price=no_ask,
                         size=min(size, max_pos - position.qty_no),
-                        reason=f"ENTRY_NO edge={fair_no - no_ask:.4f}",
+                        reason=self._entry_reason(
+                            outcome="NO",
+                            fair=fair_no,
+                            ask=no_ask,
+                            edge=fair_no - no_ask,
+                            threshold=self._settings.min_entry_edge,
+                            model_note=model_note,
+                        ),
                     )
                 )
 
@@ -107,7 +120,12 @@ class Strategy:
                         side="SELL",
                         price=yes_bid,
                         size=min(size, position.qty_yes),
-                        reason=f"EXIT_YES gain={yes_bid - position.avg_yes_price:.4f}",
+                        reason=(
+                            "Exit YES to take profit: "
+                            f"bid {yes_bid:.4f} is above avg entry {position.avg_yes_price:.4f} "
+                            f"by {yes_bid - position.avg_yes_price:.4f} "
+                            f"(min {self._settings.min_exit_edge:.4f})."
+                        ),
                     )
                 )
 
@@ -120,7 +138,12 @@ class Strategy:
                         side="SELL",
                         price=no_bid,
                         size=min(size, position.qty_no),
-                        reason=f"EXIT_NO gain={no_bid - position.avg_no_price:.4f}",
+                        reason=(
+                            "Exit NO to take profit: "
+                            f"bid {no_bid:.4f} is above avg entry {position.avg_no_price:.4f} "
+                            f"by {no_bid - position.avg_no_price:.4f} "
+                            f"(min {self._settings.min_exit_edge:.4f})."
+                        ),
                     )
                 )
 
@@ -137,8 +160,9 @@ class Strategy:
                             price=no_ask,
                             size=hedge_size,
                             reason=(
-                                "HEDGE_BUY_NO "
-                                f"combo={position.avg_yes_price + no_ask:.4f}"
+                                "Hedge by buying NO: combined YES-entry + NO-ask is "
+                                f"{position.avg_yes_price + no_ask:.4f}, within locked-in margin "
+                                f"threshold <= {1.0 - self._settings.min_hedge_margin:.4f}."
                             ),
                         )
                     )
@@ -155,13 +179,35 @@ class Strategy:
                             price=yes_ask,
                             size=hedge_size,
                             reason=(
-                                "HEDGE_BUY_YES "
-                                f"combo={position.avg_no_price + yes_ask:.4f}"
+                                "Hedge by buying YES: combined NO-entry + YES-ask is "
+                                f"{position.avg_no_price + yes_ask:.4f}, within locked-in margin "
+                                f"threshold <= {1.0 - self._settings.min_hedge_margin:.4f}."
                             ),
                         )
                     )
 
         return intents
+
+    @staticmethod
+    def _model_note_for_market(market: MarketState) -> str:
+        return ""
+
+    @staticmethod
+    def _entry_reason(
+        outcome: str,
+        fair: float,
+        ask: float,
+        edge: float,
+        threshold: float,
+        model_note: str,
+    ) -> str:
+        reason = (
+            f"Enter {outcome}: model fair {fair:.4f} is above ask {ask:.4f} "
+            f"by {edge:.4f} (min edge {threshold:.4f})."
+        )
+        if model_note:
+            return f"{reason} {model_note}"
+        return reason
 
 
 def mark_to_market_unrealized(market: MarketState, position: PositionState) -> float:

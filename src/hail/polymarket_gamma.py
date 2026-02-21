@@ -52,12 +52,12 @@ class GammaMarketScanner:
                     "order": "endDate",
                     "ascending": "false",
                 }
-                logging.info(
-                    "gamma scan request[tag=%s]: url=%s/events params=%s",
-                    tag_slug,
-                    self._settings.gamma_api_url,
-                    params,
-                )
+                # logging.info(
+                #     "gamma scan request[tag=%s]: url=%s/events params=%s",
+                #     tag_slug,
+                #     self._settings.gamma_api_url,
+                #     params,
+                # )
                 try:
                     response = await client.get(f"{self._settings.gamma_api_url}/events", params=params)
                     response.raise_for_status()
@@ -92,7 +92,7 @@ class GammaMarketScanner:
                     extracted_markets,
                 )
 
-        logging.info("gamma scan merged rows=%s unique=%s", len(all_rows), len(seen_ids))
+        # logging.info("gamma scan merged rows=%s unique=%s", len(all_rows), len(seen_ids))
 
         candidates: list[MarketDefinition] = []
         parse_reasons: Counter[str] = Counter()
@@ -116,14 +116,19 @@ class GammaMarketScanner:
             if len(candidates) >= self._settings.max_open_markets:
                 post_parse_reasons["capped_at_max_open_markets"] += 1
                 break
-        logging.info(
-            "gamma scan filtered: accepted=%s parse_rejects=%s post_parse_rejects=%s",
-            len(candidates),
-            dict(parse_reasons),
-            dict(post_parse_reasons),
-        )
-        if not candidates and parse_samples:
-            logging.info("gamma scan examples by reject reason: %s", parse_samples)
+        if parse_reasons.get("missing_strike", 0) > 0:
+            logging.info(
+                "gamma scan markets missing strike (will resolve from Binance at start time): count=%s",
+                parse_reasons["missing_strike"],
+            )
+        # logging.info(
+        #     "gamma scan filtered: accepted=%s parse_rejects=%s post_parse_rejects=%s",
+        #     len(candidates),
+        #     dict(parse_reasons),
+        #     dict(post_parse_reasons),
+        # )
+        # if not candidates and parse_samples:
+        #     logging.info("gamma scan examples by reject reason: %s", parse_samples)
         return candidates
 
     def _parse_market_row_with_reason(self, row: dict) -> tuple[MarketDefinition | None, str]:
@@ -136,9 +141,12 @@ class GammaMarketScanner:
         if window is None or window not in self._settings.target_windows_minutes:
             return None, "window_mismatch"
 
-        # Up/Down recurring markets generally do not expose strike directly in metadata.
-        # Keep a safe fallback so these markets are still tradable with a neutral prior.
-        strike = self._extract_strike_from_structured_fields(row) or 0.0
+        strike = self._extract_strike_from_structured_fields(row)
+        if strike is None:
+            strike = self._extract_strike_from_text_fields(row)
+        if strike is None:
+            # Keep market; strike will be resolved at runtime from Binance start-time price.
+            strike = 0.0
 
         condition_id = str(row.get("conditionId") or "")
         if not condition_id:
@@ -256,6 +264,17 @@ class GammaMarketScanner:
                     return parsed
             except (TypeError, ValueError):
                 continue
+        return None
+
+    @staticmethod
+    def _extract_strike_from_text_fields(row: dict) -> float | None:
+        for key in ("question", "title", "description", "subtitle", "ticker", "slug"):
+            value = row.get(key)
+            if value is None:
+                continue
+            parsed = GammaMarketScanner._extract_strike(str(value))
+            if parsed is not None and parsed > 0:
+                return parsed
         return None
 
     @staticmethod
