@@ -16,7 +16,10 @@ from hail.strategy import Strategy, mark_to_market_unrealized
 from hail.telegram_notifier import TelegramNotifier
 
 ACCOUNT_SNAPSHOT_INTERVAL_SECONDS = 60
-POSITION_RECONCILE_INTERVAL_SECONDS = 45
+POSITION_RECONCILE_INTERVAL_SECONDS = 10
+CLAIM_LOOP_START_DELAY_SECONDS = 300
+CLAIM_LOOP_INTERVAL_SECONDS = 300
+DUST_SELL_SHARES = 0.05
 
 
 class TradingEngine:
@@ -53,6 +56,7 @@ class TradingEngine:
             asyncio.create_task(self._decision_loop(), name="decision-loop"),
             asyncio.create_task(self._account_snapshot_loop(), name="account-snapshot-loop"),
             asyncio.create_task(self._position_reconcile_loop(), name="position-reconcile-loop"),
+            asyncio.create_task(self._claim_loop(), name="claim-loop"),
             asyncio.create_task(self._telegram_loop(), name="telegram-loop"),
         ]
         try:
@@ -293,6 +297,29 @@ class TradingEngine:
             except Exception as exc:  # noqa: BLE001
                 logging.warning("position reconcile loop error: %s", exc)
             await asyncio.sleep(POSITION_RECONCILE_INTERVAL_SECONDS)
+
+    async def _claim_loop(self) -> None:
+        await asyncio.sleep(CLAIM_LOOP_START_DELAY_SECONDS)
+        while not self._stop_event.is_set():
+            try:
+                claim_candidates = self._collect_claim_candidates()
+                claimed = await self._trader.claim_positions_if_resolved(claim_candidates)
+                if claimed > 0:
+                    logging.info("Claim loop completed: claimed_markets=%s", claimed)
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("claim loop error: %s", exc)
+            await asyncio.sleep(CLAIM_LOOP_INTERVAL_SECONDS)
+
+    def _collect_claim_candidates(self) -> list[MarketDefinition]:
+        now = datetime.now(tz=timezone.utc)
+        by_condition: dict[str, MarketDefinition] = {}
+
+        for condition_id, state in self._states.items():
+            if state.market.end_time <= now:
+                by_condition[condition_id] = state.market
+        for condition_id, (market, _, _) in self._recently_ended.items():
+            by_condition[condition_id] = market
+        return list(by_condition.values())
 
     def _compute_open_position_metrics(self) -> tuple[float, float, int]:
         open_value = 0.0
@@ -644,6 +671,31 @@ class TradingEngine:
                     status="SKIPPED_INSUFFICIENT_LOCAL_BALANCE",
                 )
                 return
+            if 0 < intent.size < DUST_SELL_SHARES:
+                order_id = await self._trader.place_market_close_order(intent, market)
+                if order_id:
+                    await self._db.record_intent(intent, status="POSTED", exchange_order_id=order_id)
+                    self._apply_local_fill(position, intent, market)
+                    await self._db.upsert_position(intent.condition_id, position)
+                    await self._db.record_intent(intent, status="FILLED_LOCAL", exchange_order_id=order_id)
+                    return
+                logging.info(
+                    (
+                        "Ignoring tiny SELL dust position after market-close attempt: "
+                        "side=%s outcome=%s size=%.6f threshold=%.6f"
+                    ),
+                    intent.side,
+                    "YES" if intent.token_id == market.yes_token_id else "NO",
+                    intent.size,
+                    DUST_SELL_SHARES,
+                )
+                self._clear_local_token_position(position, intent.token_id, market)
+                await self._db.upsert_position(intent.condition_id, position)
+                await self._db.record_intent(
+                    intent,
+                    status="SKIPPED_DUST_POSITION",
+                )
+                return
 
         order_id = await self._trader.place_limit_order(intent, market)
         if not order_id:
@@ -714,6 +766,20 @@ class TradingEngine:
         if token_id == market.no_token_id:
             return max(position.qty_no, 0.0)
         return 0.0
+
+    @staticmethod
+    def _clear_local_token_position(
+        position: PositionState,
+        token_id: str,
+        market: MarketDefinition,
+    ) -> None:
+        if token_id == market.yes_token_id:
+            position.qty_yes = 0.0
+            position.avg_yes_price = 0.0
+            return
+        if token_id == market.no_token_id:
+            position.qty_no = 0.0
+            position.avg_no_price = 0.0
 
     async def _telegram_loop(self) -> None:
         while not self._stop_event.is_set():

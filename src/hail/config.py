@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     poly_signature_type: int = Field(default=0, alias="POLY_SIGNATURE_TYPE")
     poly_chain_id: int = Field(default=137, alias="POLY_CHAIN_ID")
     poly_host: str = Field(default="https://clob.polymarket.com", alias="POLY_HOST")
+    polygon_rpc_url: str = Field(default="https://polygon-rpc.com", alias="POLYGON_RPC_URL")
     poly_ws_url: str = Field(
         default="wss://ws-subscriptions-clob.polymarket.com/ws/market",
         alias="POLY_WS_URL",
