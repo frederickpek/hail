@@ -6,7 +6,8 @@ PO is the place-once strategy.
 
 - Scans configured 5m/15m Polymarket markets.
 - For each never-before-entered market, reads YES/NO best bids.
-- Places one GTC buy order on each side at `best_bid - PO_PRICE_TICK`.
+- Places one GTC buy order on each side at an equal shared offset from best bid.
+- Increases that shared offset as needed to keep `yes_price + no_price < PO_PAIR_PRICE_SUM_MAX`.
 - Never re-enters the same market again.
 - Reconciles order fills asynchronously.
 - Finalizes market PnL after resolution and tracks three winrates:
@@ -30,8 +31,11 @@ flowchart TD
     scanLoop --> discovered{New market and never entered?}
     discovered -- no --> scanSleep[Sleep]
     discovered -- yes --> readBooks[Read YES and NO best bid]
-    readBooks --> priceCalc[Target price = best bid minus PO_PRICE_TICK]
-    priceCalc --> placePair[Place 2 GTC BUY orders YES and NO]
+    readBooks --> priceCalc[Target prices = best bids minus shared offset]
+    priceCalc --> sumCap{YES+NO below PO_PAIR_PRICE_SUM_MAX?}
+    sumCap -- no --> widenOffset[Increase shared offset equally]
+    widenOffset --> sumCap
+    sumCap -- yes --> placePair[Place 2 GTC BUY orders YES and NO]
     placePair --> markEntered[Persist market as entered forever]
     markEntered --> scanSleep
     scanSleep --> scanLoop
@@ -76,8 +80,11 @@ PO settings in `.env`:
 - `PO_RESOLUTION_POLL_INTERVAL_SECONDS` (default: `30`)
 - `PO_STATS_INTERVAL_SECONDS` (default: `300`)
 - `PO_DAILY_REPORT_INTERVAL_SECONDS` (default: `86400`)
+- `PO_DAILY_REPORT_ENABLED` (default: `true`)
+- `PO_RESET_STATS_ON_START` (default: `false`)
 - `PO_ORDER_SIZE` (default: `5`)
 - `PO_PRICE_TICK` (default: `0.01`)
+- `PO_PAIR_PRICE_SUM_MAX` (default: `0.98`)
 - `PO_DRY_RUN` (default: `false`)
 
 General required settings:

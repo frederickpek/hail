@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Any
 
 import httpx
@@ -15,6 +17,9 @@ from hail.polymarket_gamma import GammaMarketScanner
 from hail.polymarket_trader import PolymarketTrader
 from hail.polymarket_ws import PolymarketBookFeed
 from hail.telegram_notifier import TelegramNotifier
+
+PO_ORDER_POST_ATTEMPTS = 2
+PO_ORDER_RETRY_DELAY_SECONDS = 1.0
 
 
 class PoEngine:
@@ -37,6 +42,9 @@ class PoEngine:
         self._settings.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._settings.log_path.parent.mkdir(parents=True, exist_ok=True)
         await self._db.init()
+        if self._settings.po_reset_stats_on_start:
+            await self._db.reset_stats()
+            logging.info("PO stats reset on startup (PO_RESET_STATS_ON_START=true)")
         self._entered_condition_ids = await self._db.list_entered_condition_ids()
         await self._trader.connect()
 
@@ -86,9 +94,11 @@ class PoEngine:
     async def _register_markets(self, markets: list[MarketDefinition]) -> None:
         now = datetime.now(tz=timezone.utc)
         token_ids: list[str] = []
+        active_condition_ids: set[str] = set()
         for market in markets:
             if market.end_time <= now:
                 continue
+            active_condition_ids.add(market.condition_id)
             if market.condition_id not in self._states:
                 self._states[market.condition_id] = MarketState(market=market)
             else:
@@ -98,6 +108,29 @@ class PoEngine:
             token_ids.extend([market.yes_token_id, market.no_token_id])
         if token_ids:
             await self._book_feed.add_assets(token_ids)
+
+        ended_condition_ids: list[str] = []
+        remove_token_ids: list[str] = []
+        for condition_id, state in list(self._states.items()):
+            if condition_id in active_condition_ids:
+                continue
+            if state.market.end_time > now:
+                continue
+            ended_condition_ids.append(condition_id)
+            remove_token_ids.extend([state.market.yes_token_id, state.market.no_token_id])
+            self._states.pop(condition_id, None)
+
+        if ended_condition_ids:
+            for token_id, marker in list(self._token_to_market.items()):
+                if marker[0] in set(ended_condition_ids):
+                    self._token_to_market.pop(token_id, None)
+            if remove_token_ids:
+                await self._book_feed.remove_assets(remove_token_ids)
+            logging.info(
+                "Pruned ended PO markets: markets=%s removed_token_ids=%s",
+                len(ended_condition_ids),
+                len(remove_token_ids),
+            )
 
     async def _place_for_new_markets(self) -> None:
         now = datetime.now(tz=timezone.utc)
@@ -112,10 +145,10 @@ class PoEngine:
             if yes_bid is None or no_bid is None:
                 continue
 
-            yes_price = self._clip_price(yes_bid - self._settings.po_price_tick)
-            no_price = self._clip_price(no_bid - self._settings.po_price_tick)
-            if yes_price is None or no_price is None:
+            pair_prices = self._compute_pair_prices(yes_bid=yes_bid, no_bid=no_bid)
+            if pair_prices is None:
                 continue
+            yes_price, no_price = pair_prices
 
             inserted = await self._db.register_market_once(
                 state.market,
@@ -138,7 +171,7 @@ class PoEngine:
             side="BUY",
             price=yes_price,
             size=size,
-            reason="po_yes_bid_minus_tick",
+            reason="po_yes_bid_shared_offset",
         )
         no_order = PoOrder(
             condition_id=market.condition_id,
@@ -147,26 +180,51 @@ class PoEngine:
             side="BUY",
             price=no_price,
             size=size,
-            reason="po_no_bid_minus_tick",
+            reason="po_no_bid_shared_offset",
         )
-        await self._submit_order(yes_order, market)
-        await self._submit_order(no_order, market)
+        yes_row_id, yes_exchange_order_id = await self._submit_order_with_retry(yes_order, market)
+        if yes_exchange_order_id is None and not self._settings.po_dry_run:
+            logging.warning(
+                "Skipping paired NO order because YES leg failed after retry: condition=%s",
+                market.condition_id,
+            )
+            return
+
+        no_row_id, no_exchange_order_id = await self._submit_order_with_retry(no_order, market)
+        if yes_exchange_order_id and not no_exchange_order_id:
+            await self._cancel_posted_leg(
+                row_id=yes_row_id,
+                exchange_order_id=yes_exchange_order_id,
+                market=market,
+                failed_outcome="NO",
+            )
+        elif no_exchange_order_id and not yes_exchange_order_id:
+            await self._cancel_posted_leg(
+                row_id=no_row_id,
+                exchange_order_id=no_exchange_order_id,
+                market=market,
+                failed_outcome="YES",
+            )
+        end_time_sg = market.end_time.astimezone(ZoneInfo("Asia/Singapore"))
+        end_time_display = (
+            f"{end_time_sg.day} {end_time_sg.strftime('%b')} "
+            f"{end_time_sg.strftime('%-I:%M%p').lower()}"
+        )
+        market_display = f"{market.symbol} {market.window_minutes}m, {end_time_display}"
         logging.info(
-            "Entered market once: %s %sm condition=%s yes_bid=%.4f no_bid=%.4f size=%.4f dry_run=%s",
-            market.symbol,
-            market.window_minutes,
-            market.condition_id,
+            "✅ Entered market once: %s yes_price=%.4f no_price=%.4f size=%.4f condition=%s",
+            market_display,
             yes_price,
             no_price,
             size,
-            self._settings.po_dry_run,
+            market.condition_id,
         )
 
-    async def _submit_order(self, order: PoOrder, market: MarketDefinition) -> None:
+    async def _submit_order_with_retry(self, order: PoOrder, market: MarketDefinition) -> tuple[int, str | None]:
         row_id = await self._db.record_order_created(order)
         if self._settings.po_dry_run:
             await self._db.mark_order_status(row_id, "DRY_RUN")
-            return
+            return row_id, "DRY_RUN"
         intent = TradeIntent(
             condition_id=order.condition_id,
             token_id=order.token_id,
@@ -175,11 +233,58 @@ class PoEngine:
             size=order.size,
             reason=order.reason,
         )
-        exchange_order_id = await self._trader.place_limit_order(intent, market)
-        if not exchange_order_id:
-            await self._db.mark_order_status(row_id, "FAILED")
+        for attempt in range(1, PO_ORDER_POST_ATTEMPTS + 1):
+            exchange_order_id = await self._trader.place_limit_order(intent, market)
+            if exchange_order_id:
+                await self._db.mark_order_posted(row_id, exchange_order_id)
+                return row_id, exchange_order_id
+            if attempt < PO_ORDER_POST_ATTEMPTS:
+                logging.warning(
+                    (
+                        "PO order post failed; retrying once: condition=%s "
+                        "outcome=%s attempt=%s/%s"
+                    ),
+                    order.condition_id,
+                    order.outcome,
+                    attempt + 1,
+                    PO_ORDER_POST_ATTEMPTS,
+                )
+                await asyncio.sleep(PO_ORDER_RETRY_DELAY_SECONDS)
+        await self._db.mark_order_status(row_id, "FAILED")
+        return row_id, None
+
+    async def _cancel_posted_leg(
+        self,
+        *,
+        row_id: int,
+        exchange_order_id: str,
+        market: MarketDefinition,
+        failed_outcome: str,
+    ) -> None:
+        cancelled = self._trader.cancel_order(exchange_order_id)
+        if cancelled:
+            await self._db.mark_order_status(row_id, "CANCEL_REQUESTED")
+            logging.warning(
+                (
+                    "Cancelled paired posted order after opposite leg failure: "
+                    "condition=%s failed_outcome=%s cancelled_order_id=%s"
+                ),
+                market.condition_id,
+                failed_outcome,
+                exchange_order_id,
+            )
             return
-        await self._db.mark_order_posted(row_id, exchange_order_id)
+
+        await self._db.mark_order_status(row_id, "CANCEL_FAILED")
+        logging.error(
+            (
+                "Failed to cancel paired posted order after opposite leg failure: "
+                "condition=%s failed_outcome=%s order_id=%s"
+            ),
+            market.condition_id,
+            failed_outcome,
+            exchange_order_id,
+        )
 
     async def _fill_reconcile_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -190,10 +295,36 @@ class PoEngine:
                     if snapshot is None:
                         continue
                     filled_size, status = snapshot
+                    previous_filled = max(float(order.get("filled_size", 0.0)), 0.0)
+                    previous_status = str(order.get("status", ""))
+                    current_filled = max(filled_size, 0.0)
+                    current_status = (status or "OPEN").upper()
+                    fill_delta = current_filled - previous_filled
+
+                    if fill_delta > 1e-9:
+                        market_display = self._format_market_display(
+                            symbol=order.get("symbol"),
+                            window_minutes=order.get("window_minutes"),
+                            end_time_iso=order.get("end_time"),
+                        )
+                        logging.info(
+                            (
+                                "PO fill update: market=%s "
+                                "delta=%.6f total=%.6f status=%s->%s "
+                                "condition=%s order_id=%s"
+                            ),
+                            market_display,
+                            fill_delta,
+                            current_filled,
+                            previous_status,
+                            current_status,
+                            order["condition_id"],
+                            order["exchange_order_id"],
+                        )
                     await self._db.upsert_order_snapshot(
                         exchange_order_id=order["exchange_order_id"],
-                        new_status=status or "OPEN",
-                        new_filled_size=max(filled_size, 0.0),
+                        new_status=current_status,
+                        new_filled_size=current_filled,
                     )
             except Exception as exc:  # noqa: BLE001
                 logging.warning("po fill reconcile error: %s", exc)
@@ -228,16 +359,37 @@ class PoEngine:
         while not self._stop_event.is_set():
             try:
                 if self._notifier.enabled:
-                    rows = await self._db.list_unannounced_results(limit=50)
+                    rows = await self._db.list_unannounced_results(limit=10)
+                    now = datetime.now(tz=timezone.utc)
                     for row in rows:
+                        end_time_raw = str(row.get("end_time") or "")
+                        try:
+                            end_time = datetime.fromisoformat(end_time_raw)
+                            if end_time.tzinfo is None:
+                                end_time = end_time.replace(tzinfo=timezone.utc)
+                        except ValueError:
+                            end_time = now
+
+                        if (now - end_time).total_seconds() > (20 * 60):
+                            await self._db.mark_result_announced(row["condition_id"])
+                            continue
+
+                        market_display = self._format_market_display(
+                            symbol=row.get("symbol"),
+                            window_minutes=row.get("window_minutes"),
+                            end_time_iso=row.get("end_time"),
+                        )
+                        pnl = float(row["pnl"])
+                        icon = "✅" if pnl > 0 else "❌"
                         message = (
-                            f"{row['symbol']} {row['window_minutes']}m resolved={row['resolved_side']} "
+                            f"{icon} {market_display} resolved={row['resolved_side']} "
                             f"yes_fill={row['yes_filled_qty']:.4f}@{row['yes_avg_fill_price']:.4f} "
                             f"no_fill={row['no_filled_qty']:.4f}@{row['no_avg_fill_price']:.4f} "
-                            f"pnl=${row['pnl']:.4f}"
+                            f"pnl=${pnl:.4f}"
                         )
                         await self._notifier.send(message)
                         await self._db.mark_result_announced(row["condition_id"])
+                        await asyncio.sleep(1)
             except Exception as exc:  # noqa: BLE001
                 logging.warning("po result announce loop error: %s", exc)
             await asyncio.sleep(30)
@@ -282,7 +434,7 @@ class PoEngine:
         both_winrate = self._pct(window_both_wins, window_both_markets)
         one_winrate = self._pct(window_one_wins, window_one_markets)
 
-        if self._notifier.enabled:
+        if self._settings.po_daily_report_enabled and self._notifier.enabled:
             message = "\n".join(
                 [
                     "PO 24h window report",
@@ -380,7 +532,59 @@ class PoEngine:
                         parsed = self._normalize_outcome(outcome)
                         if parsed is not None:
                             return parsed
+            parsed_outcomes = self._parse_list_field(outcomes)
+            outcome_prices = self._parse_list_field(row.get("outcomePrices") or row.get("outcome_prices"))
+            is_closed = bool(row.get("closed"))
+            if is_closed and parsed_outcomes and outcome_prices and len(parsed_outcomes) == len(outcome_prices):
+                for outcome, outcome_price in zip(parsed_outcomes, outcome_prices):
+                    try:
+                        price_float = float(outcome_price)
+                    except (TypeError, ValueError):
+                        continue
+                    if price_float > 1.0:
+                        price_float = price_float / 100.0
+                    # Closed market with a ~1.0 settlement price indicates resolved winner.
+                    if price_float >= 0.99:
+                        parsed = self._normalize_outcome(outcome)
+                        if parsed is not None:
+                            return parsed
         return None
+
+    @staticmethod
+    def _parse_list_field(value: Any) -> list[Any]:
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                return []
+            if isinstance(parsed, list):
+                return parsed
+        return []
+
+    @staticmethod
+    def _format_market_display(
+        *,
+        symbol: Any,
+        window_minutes: Any,
+        end_time_iso: Any,
+    ) -> str:
+        if symbol is None or window_minutes is None or not end_time_iso:
+            return "unknown-market"
+        end_time_text = str(end_time_iso)
+        try:
+            end_time = datetime.fromisoformat(end_time_text.replace("Z", "+00:00"))
+            if end_time.tzinfo is None:
+                end_time = end_time.replace(tzinfo=timezone.utc)
+            end_time_sg = end_time.astimezone(ZoneInfo("Asia/Singapore"))
+            end_time_display = (
+                f"{end_time_sg.day} {end_time_sg.strftime('%b')} "
+                f"{end_time_sg.strftime('%-I:%M%p').lower()}"
+            )
+            return f"{symbol} {int(window_minutes)}m, {end_time_display}"
+        except (TypeError, ValueError):
+            return f"{symbol} {window_minutes}m"
 
     @staticmethod
     def _normalize_outcome(value: Any) -> str | None:
@@ -421,6 +625,36 @@ class PoEngine:
         if clipped >= 1:
             return None
         return clipped
+
+    def _compute_pair_prices(self, yes_bid: float, no_bid: float) -> tuple[float, float] | None:
+        max_pair_sum = self._settings.po_pair_price_sum_max
+        min_margin = 0.0001
+        target_sum_cap = max_pair_sum - min_margin
+        if target_sum_cap <= 0:
+            return None
+
+        # Keep both orders an equal distance from their respective best bids.
+        shared_offset = max(self._settings.po_price_tick, 0.0)
+        initial_sum = yes_bid + no_bid - (2 * shared_offset)
+        if initial_sum >= target_sum_cap:
+            shared_offset += (initial_sum - target_sum_cap) / 2.0
+
+        yes_price = self._clip_price(yes_bid - shared_offset)
+        no_price = self._clip_price(no_bid - shared_offset)
+        if yes_price is None or no_price is None:
+            return None
+
+        # Rounding can push the sum up slightly; nudge both legs down equally.
+        step = 0.0001
+        for _ in range(25):
+            if yes_price + no_price < max_pair_sum:
+                return yes_price, no_price
+            shared_offset += step
+            yes_price = self._clip_price(yes_bid - shared_offset)
+            no_price = self._clip_price(no_bid - shared_offset)
+            if yes_price is None or no_price is None:
+                return None
+        return None
 
     @staticmethod
     def _pct(wins: int, total: int) -> float:

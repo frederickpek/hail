@@ -84,10 +84,25 @@ class PolymarketTrader:
         else:
             raise ValueError(f"Unsupported side: {intent.side}")
 
+        submit_size = self._normalize_order_size(intent)
+        if intent.reason.startswith("po_") and abs(submit_size - float(intent.size)) > 1e-9:
+            logging.warning(
+                (
+                    "Rejecting PO order due to size deviation: condition=%s token=%s "
+                    "requested_size=%.6f normalized_size=%.6f price=%.4f"
+                ),
+                intent.condition_id,
+                intent.token_id,
+                float(intent.size),
+                submit_size,
+                float(intent.price),
+            )
+            return None
+
         args = self._order_args_cls(
             token_id=intent.token_id,
             price=round(intent.price, 4),
-            size=self._normalize_order_size(intent),
+            size=submit_size,
             side=side,
         )
         end_time_sg = market.end_time.astimezone(ZoneInfo("Asia/Singapore"))
@@ -97,20 +112,20 @@ class PolymarketTrader:
         )
         market_display = f"{market.symbol} {market.window_minutes}m, {end_time_display}"
         outcome_side = "YES" if intent.token_id == market.yes_token_id else "NO"
-        logging.info(
-            (
-                "Order attempt: %s %s market=%s requested_size=%.4f "
-                "submit_size=%.4f price=%.4f submit_notional=%.4f reason=%s"
-            ),
-            intent.side,
-            outcome_side,
-            market_display,
-            intent.size,
-            args.size,
-            args.price,
-            args.size * args.price,
-            intent.reason,
-        )
+        # logging.info(
+        #     (
+        #         "Order attempt: %s %s market=%s requested_size=%.4f "
+        #         "submit_size=%.4f price=%.4f submit_notional=%.4f reason=%s"
+        #     ),
+        #     intent.side,
+        #     outcome_side,
+        #     market_display,
+        #     intent.size,
+        #     args.size,
+        #     args.price,
+        #     args.size * args.price,
+        #     intent.reason,
+        # )
         try:
             response = self._client.create_and_post_order(args)
             order_id = response.get("orderID")
@@ -156,10 +171,10 @@ class PolymarketTrader:
                     message,
                 )
             else:
-                logging.exception("Order failed for condition=%s: %s", intent.condition_id, exc)
+                logging.error("❌ Order failed for condition=%s: %s", intent.condition_id, exc)
             return None
         except Exception as exc:  # noqa: BLE001
-            logging.exception("Order failed for condition=%s: %s", intent.condition_id, exc)
+            logging.exception("❌ Order failed for condition=%s: %s", intent.condition_id, exc)
             return None
 
     async def place_market_close_order(self, intent: TradeIntent, market: MarketDefinition) -> str | None:
@@ -234,6 +249,20 @@ class PolymarketTrader:
         except Exception as exc:  # noqa: BLE001
             logging.warning("Failed to fetch order fill snapshot for order_id=%s: %s", order_id, exc)
             return None
+
+    def cancel_order(self, order_id: str) -> bool:
+        if self._client is None:
+            return False
+        try:
+            self._client.cancel(order_id)
+            logging.info("Cancel request sent for order_id=%s", order_id)
+            return True
+        except PolyApiException as exc:
+            logging.warning("Cancel failed for order_id=%s: %s", order_id, exc)
+            return False
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Cancel failed for order_id=%s: %s", order_id, exc)
+            return False
 
     def _log_collateral_balance(self) -> None:
         balance = self.get_collateral_balance_usdc()
@@ -434,15 +463,6 @@ class PolymarketTrader:
             self._web3 = Web3(Web3.HTTPProvider(self._settings.polygon_rpc_url))
             account = self._web3.eth.account.from_key(self._settings.private_key)
             self._signer_address = account.address
-            if self._settings.funder_address and account.address.lower() != self._settings.funder_address.lower():
-                logging.warning(
-                    (
-                        "Claim loop disabled: signer address differs from funder "
-                        "(signer=%s funder=%s)."
-                    ),
-                    account.address,
-                    self._settings.funder_address,
-                )
         except Exception as exc:  # noqa: BLE001
             self._web3 = None
             self._signer_address = None
@@ -452,8 +472,6 @@ class PolymarketTrader:
         if self._web3 is None or not self._settings.private_key or not markets:
             return 0
         if self._signer_address is None:
-            return 0
-        if self._settings.funder_address and self._signer_address.lower() != self._settings.funder_address.lower():
             return 0
 
         claimed = 0

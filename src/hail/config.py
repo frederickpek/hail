@@ -48,8 +48,11 @@ class Settings(BaseSettings):
         default=86400,
         alias="PO_DAILY_REPORT_INTERVAL_SECONDS",
     )
+    po_daily_report_enabled: bool = Field(default=True, alias="PO_DAILY_REPORT_ENABLED")
+    po_reset_stats_on_start: bool = Field(default=False, alias="PO_RESET_STATS_ON_START")
     po_order_size: float = Field(default=5.0, alias="PO_ORDER_SIZE")
     po_price_tick: float = Field(default=0.01, alias="PO_PRICE_TICK")
+    po_pair_price_sum_max: float = Field(default=0.98, alias="PO_PAIR_PRICE_SUM_MAX")
     po_dry_run: bool = Field(default=False, alias="PO_DRY_RUN")
 
     telegram_bot_token: str | None = Field(default=None, alias="TELEGRAM_BOT_TOKEN")

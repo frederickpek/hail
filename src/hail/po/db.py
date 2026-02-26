@@ -144,6 +144,31 @@ class PoDatabase:
             rows = await cursor.fetchall()
         return {str(row[0]) for row in rows}
 
+    async def reset_stats(self) -> None:
+        now_iso = utc_now_iso()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                UPDATE po_stats
+                SET markets_entered_total = 0,
+                    orders_placed_total = 0,
+                    orders_filled_total = 0,
+                    markets_finalized_total = 0,
+                    both_filled_markets_total = 0,
+                    both_filled_wins_total = 0,
+                    one_filled_markets_total = 0,
+                    one_filled_wins_total = 0,
+                    combined_markets_total = 0,
+                    combined_wins_total = 0,
+                    lifetime_pnl_total = 0,
+                    updated_at = ?
+                WHERE id = 1
+                """,
+                (now_iso,),
+            )
+            await db.execute("DELETE FROM po_daily_windows")
+            await db.commit()
+
     async def register_market_once(
         self,
         market: MarketDefinition,
@@ -246,11 +271,20 @@ class PoDatabase:
     async def list_orders_for_reconcile(self) -> list[dict[str, Any]]:
         placeholders = ",".join("?" for _ in TERMINAL_ORDER_STATUSES)
         query = f"""
-            SELECT id, exchange_order_id, condition_id, filled_size, status
-            FROM po_orders
-            WHERE exchange_order_id IS NOT NULL
+            SELECT
+                o.id,
+                o.exchange_order_id,
+                o.condition_id,
+                o.filled_size,
+                o.status,
+                m.symbol,
+                m.window_minutes,
+                m.end_time
+            FROM po_orders o
+            LEFT JOIN po_markets m ON m.condition_id = o.condition_id
+            WHERE o.exchange_order_id IS NOT NULL
               AND UPPER(status) NOT IN ({placeholders})
-            ORDER BY id ASC
+            ORDER BY o.id ASC
         """
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(query, tuple(TERMINAL_ORDER_STATUSES))
@@ -262,6 +296,9 @@ class PoDatabase:
                 "condition_id": str(row[2]),
                 "filled_size": float(row[3]),
                 "status": str(row[4]),
+                "symbol": None if row[5] is None else str(row[5]),
+                "window_minutes": None if row[6] is None else int(row[6]),
+                "end_time": None if row[7] is None else str(row[7]),
             }
             for row in rows
         ]
