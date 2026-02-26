@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 hail = "hail.main:main"
+hail-po = "hail.place_once_main:main"
 
 [build-system]
 requires = ["hatchling"]

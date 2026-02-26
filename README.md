@@ -35,11 +35,51 @@ uv sync
 - `./logs` for logs
 - `./data` for SQLite database
 
-4. Run:
+4. Run the original strategy bot:
 
 ```bash
-uv run hail-bot
+uv run hail
 ```
+
+## Place-Once Strategy (new)
+
+This repo also includes a separate entrypoint for a place-once strategy:
+
+- Scans configured 5m/15m Polymarket markets.
+- For each never-before-entered market, reads YES/NO best bids.
+- Places one GTC buy order on each side at `best_bid - PO_PRICE_TICK`.
+- Never re-enters the same market again.
+- Reconciles order fills asynchronously.
+- Finalizes market PnL after resolution and tracks three winrates:
+  - both legs filled,
+  - one leg filled,
+  - combined.
+- Logs summary stats every 5 minutes and sends a 24h Telegram report.
+
+Run it:
+
+```bash
+uv run hail-place-once
+```
+
+Recommended first run in dry mode:
+
+```bash
+PO_DRY_RUN=true uv run hail-place-once
+```
+
+### Place-Once Config
+
+Add these environment variables in `.env`:
+
+- `PO_SCAN_INTERVAL_SECONDS` (default: `30`)
+- `PO_FILL_POLL_INTERVAL_SECONDS` (default: `15`)
+- `PO_RESOLUTION_POLL_INTERVAL_SECONDS` (default: `30`)
+- `PO_STATS_INTERVAL_SECONDS` (default: `300`)
+- `PO_DAILY_REPORT_INTERVAL_SECONDS` (default: `86400`)
+- `PO_ORDER_SIZE` (default: `5`)
+- `PO_PRICE_TICK` (default: `0.01`)
+- `PO_DRY_RUN` (default: `false`)
 
 ## Core Strategy Rules
 
