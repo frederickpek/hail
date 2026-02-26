@@ -2,7 +2,7 @@
 name = "hail"
 version = "0.1.0"
 description = "Automated Polymarket short-horizon trader"
-readme = "README.md"
+readme = "README_MAIN.md"
 requires-python = ">=3.11"
 dependencies = [
   "aiosqlite>=0.21.0",
@@ -17,7 +17,7 @@ dependencies = [
 
 [project.scripts]
 hail = "hail.main:main"
-hail-po = "hail.place_once_main:main"
+hail-po = "hail.po.main:main"
 
 [build-system]
 requires = ["hatchling"]

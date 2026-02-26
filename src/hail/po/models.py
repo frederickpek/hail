@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 
 @dataclass(slots=True)
-class PlaceOnceOrder:
+class PoOrder:
     condition_id: str
     token_id: str
     outcome: str

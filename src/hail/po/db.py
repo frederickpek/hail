@@ -6,7 +6,7 @@ from typing import Any
 import aiosqlite
 
 from hail.models import MarketDefinition
-from hail.place_once_models import MarketFillSummary, PlaceOnceOrder
+from hail.po.models import MarketFillSummary, PoOrder
 
 TERMINAL_ORDER_STATUSES = {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}
 
@@ -15,7 +15,7 @@ def utc_now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
 
-class PlaceOnceDatabase:
+class PoDatabase:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
 
@@ -187,7 +187,7 @@ class PlaceOnceDatabase:
             await db.commit()
         return inserted
 
-    async def record_order_created(self, order: PlaceOnceOrder) -> int:
+    async def record_order_created(self, order: PoOrder) -> int:
         now_iso = utc_now_iso()
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
@@ -417,7 +417,13 @@ class PlaceOnceDatabase:
             )
             row = await cursor.fetchone()
         if row is None:
-            return MarketFillSummary(condition_id=condition_id, yes_filled_qty=0.0, yes_avg_price=0.0, no_filled_qty=0.0, no_avg_price=0.0)
+            return MarketFillSummary(
+                condition_id=condition_id,
+                yes_filled_qty=0.0,
+                yes_avg_price=0.0,
+                no_filled_qty=0.0,
+                no_avg_price=0.0,
+            )
         return MarketFillSummary(
             condition_id=condition_id,
             yes_filled_qty=float(row[0] or 0.0),

@@ -9,18 +9,18 @@ import httpx
 
 from hail.config import Settings
 from hail.models import MarketDefinition, MarketState, OrderBookTop, TradeIntent
-from hail.place_once_db import PlaceOnceDatabase
-from hail.place_once_models import MarketFillSummary, PlaceOnceOrder
+from hail.po.db import PoDatabase
+from hail.po.models import MarketFillSummary, PoOrder
 from hail.polymarket_gamma import GammaMarketScanner
 from hail.polymarket_trader import PolymarketTrader
 from hail.polymarket_ws import PolymarketBookFeed
 from hail.telegram_notifier import TelegramNotifier
 
 
-class PlaceOnceEngine:
+class PoEngine:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._db = PlaceOnceDatabase(str(settings.db_path))
+        self._db = PoDatabase(str(settings.db_path))
         self._scanner = GammaMarketScanner(settings)
         self._trader = PolymarketTrader(settings)
         self._notifier = TelegramNotifier(settings)
@@ -80,8 +80,8 @@ class PlaceOnceEngine:
                 await self._register_markets(markets)
                 await self._place_for_new_markets()
             except Exception as exc:  # noqa: BLE001
-                logging.warning("place-once scan/place loop error: %s", exc)
-            await asyncio.sleep(self._settings.place_once_scan_interval_seconds)
+                logging.warning("po scan/place loop error: %s", exc)
+            await asyncio.sleep(self._settings.po_scan_interval_seconds)
 
     async def _register_markets(self, markets: list[MarketDefinition]) -> None:
         now = datetime.now(tz=timezone.utc)
@@ -112,8 +112,8 @@ class PlaceOnceEngine:
             if yes_bid is None or no_bid is None:
                 continue
 
-            yes_price = self._clip_price(yes_bid - self._settings.place_once_price_tick)
-            no_price = self._clip_price(no_bid - self._settings.place_once_price_tick)
+            yes_price = self._clip_price(yes_bid - self._settings.po_price_tick)
+            no_price = self._clip_price(no_bid - self._settings.po_price_tick)
             if yes_price is None or no_price is None:
                 continue
 
@@ -130,24 +130,24 @@ class PlaceOnceEngine:
             await self._place_market_pair(state.market, yes_price, no_price)
 
     async def _place_market_pair(self, market: MarketDefinition, yes_price: float, no_price: float) -> None:
-        size = max(self._settings.place_once_order_size, 0.0)
-        yes_order = PlaceOnceOrder(
+        size = max(self._settings.po_order_size, 0.0)
+        yes_order = PoOrder(
             condition_id=market.condition_id,
             token_id=market.yes_token_id,
             outcome="YES",
             side="BUY",
             price=yes_price,
             size=size,
-            reason="place_once_yes_bid_minus_tick",
+            reason="po_yes_bid_minus_tick",
         )
-        no_order = PlaceOnceOrder(
+        no_order = PoOrder(
             condition_id=market.condition_id,
             token_id=market.no_token_id,
             outcome="NO",
             side="BUY",
             price=no_price,
             size=size,
-            reason="place_once_no_bid_minus_tick",
+            reason="po_no_bid_minus_tick",
         )
         await self._submit_order(yes_order, market)
         await self._submit_order(no_order, market)
@@ -159,12 +159,12 @@ class PlaceOnceEngine:
             yes_price,
             no_price,
             size,
-            self._settings.place_once_dry_run,
+            self._settings.po_dry_run,
         )
 
-    async def _submit_order(self, order: PlaceOnceOrder, market: MarketDefinition) -> None:
+    async def _submit_order(self, order: PoOrder, market: MarketDefinition) -> None:
         row_id = await self._db.record_order_created(order)
-        if self._settings.place_once_dry_run:
+        if self._settings.po_dry_run:
             await self._db.mark_order_status(row_id, "DRY_RUN")
             return
         intent = TradeIntent(
@@ -196,8 +196,8 @@ class PlaceOnceEngine:
                         new_filled_size=max(filled_size, 0.0),
                     )
             except Exception as exc:  # noqa: BLE001
-                logging.warning("place-once fill reconcile error: %s", exc)
-            await asyncio.sleep(self._settings.place_once_fill_poll_interval_seconds)
+                logging.warning("po fill reconcile error: %s", exc)
+            await asyncio.sleep(self._settings.po_fill_poll_interval_seconds)
 
     async def _resolution_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -221,8 +221,8 @@ class PlaceOnceEngine:
                         fill_summary=fill_summary,
                     )
             except Exception as exc:  # noqa: BLE001
-                logging.warning("place-once resolution loop error: %s", exc)
-            await asyncio.sleep(self._settings.place_once_resolution_poll_interval_seconds)
+                logging.warning("po resolution loop error: %s", exc)
+            await asyncio.sleep(self._settings.po_resolution_poll_interval_seconds)
 
     async def _result_announce_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -239,7 +239,7 @@ class PlaceOnceEngine:
                         await self._notifier.send(message)
                         await self._db.mark_result_announced(row["condition_id"])
             except Exception as exc:  # noqa: BLE001
-                logging.warning("place-once result announce loop error: %s", exc)
+                logging.warning("po result announce loop error: %s", exc)
             await asyncio.sleep(30)
 
     async def _stats_loop(self) -> None:
@@ -247,8 +247,8 @@ class PlaceOnceEngine:
             try:
                 await self._log_stats_snapshot()
             except Exception as exc:  # noqa: BLE001
-                logging.warning("place-once stats loop error: %s", exc)
-            await asyncio.sleep(self._settings.place_once_stats_interval_seconds)
+                logging.warning("po stats loop error: %s", exc)
+            await asyncio.sleep(self._settings.po_stats_interval_seconds)
 
     async def _daily_report_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -256,8 +256,8 @@ class PlaceOnceEngine:
                 async with self._daily_lock:
                     await self._send_daily_report()
             except Exception as exc:  # noqa: BLE001
-                logging.warning("place-once daily report loop error: %s", exc)
-            await asyncio.sleep(self._settings.place_once_daily_report_interval_seconds)
+                logging.warning("po daily report loop error: %s", exc)
+            await asyncio.sleep(self._settings.po_daily_report_interval_seconds)
 
     async def _send_daily_report(self) -> None:
         stats = await self._db.get_stats()
@@ -285,7 +285,7 @@ class PlaceOnceEngine:
         if self._notifier.enabled:
             message = "\n".join(
                 [
-                    "PlaceOnce 24h window report",
+                    "PO 24h window report",
                     f"pnl=${window_pnl:.4f}",
                     f"winrate_both={both_winrate:.2f}%",
                     f"winrate_one={one_winrate:.2f}%",
@@ -308,7 +308,7 @@ class PlaceOnceEngine:
         combined_winrate = self._pct(int(stats["combined_wins_total"]), int(stats["combined_markets_total"]))
         logging.info(
             (
-                "PlaceOnce stats | entered=%s open=%s placed=%s filled_orders=%s finalized=%s "
+                "PO stats | entered=%s open=%s placed=%s filled_orders=%s finalized=%s "
                 "pnl=%.4f winrate_both=%.2f%% winrate_one=%.2f%% winrate_combined=%.2f%%"
             ),
             int(stats["markets_entered_total"]),
@@ -368,7 +368,6 @@ class PlaceOnceEngine:
                 parsed = self._normalize_outcome(value)
                 if parsed is not None:
                     return parsed
-            # Some payloads encode numeric payouts.
             outcomes = row.get("outcomes")
             payouts = row.get("payouts")
             if isinstance(outcomes, list) and isinstance(payouts, list) and len(outcomes) == len(payouts):

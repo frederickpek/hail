@@ -40,17 +40,17 @@ class Settings(BaseSettings):
     max_position_per_market: float = Field(default=15.0, alias="MAX_POSITION_PER_MARKET")
     max_open_markets: int = Field(default=20, alias="MAX_OPEN_MARKETS")
     scan_interval_seconds: int = Field(default=30, alias="SCAN_INTERVAL_SECONDS")
-    place_once_scan_interval_seconds: int = Field(default=30, alias="PO_SCAN_INTERVAL_SECONDS")
-    place_once_fill_poll_interval_seconds: int = Field(default=15, alias="PO_FILL_POLL_INTERVAL_SECONDS")
-    place_once_resolution_poll_interval_seconds: int = Field(default=30, alias="PO_RESOLUTION_POLL_INTERVAL_SECONDS")
-    place_once_stats_interval_seconds: int = Field(default=300, alias="PO_STATS_INTERVAL_SECONDS")
-    place_once_daily_report_interval_seconds: int = Field(
+    po_scan_interval_seconds: int = Field(default=30, alias="PO_SCAN_INTERVAL_SECONDS")
+    po_fill_poll_interval_seconds: int = Field(default=15, alias="PO_FILL_POLL_INTERVAL_SECONDS")
+    po_resolution_poll_interval_seconds: int = Field(default=30, alias="PO_RESOLUTION_POLL_INTERVAL_SECONDS")
+    po_stats_interval_seconds: int = Field(default=300, alias="PO_STATS_INTERVAL_SECONDS")
+    po_daily_report_interval_seconds: int = Field(
         default=86400,
         alias="PO_DAILY_REPORT_INTERVAL_SECONDS",
     )
-    place_once_order_size: float = Field(default=5.0, alias="PO_ORDER_SIZE")
-    place_once_price_tick: float = Field(default=0.01, alias="PO_PRICE_TICK")
-    place_once_dry_run: bool = Field(default=False, alias="PO_DRY_RUN")
+    po_order_size: float = Field(default=5.0, alias="PO_ORDER_SIZE")
+    po_price_tick: float = Field(default=0.01, alias="PO_PRICE_TICK")
+    po_dry_run: bool = Field(default=False, alias="PO_DRY_RUN")
 
     telegram_bot_token: str | None = Field(default=None, alias="TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str | None = Field(default=None, alias="TELEGRAM_CHAT_ID")

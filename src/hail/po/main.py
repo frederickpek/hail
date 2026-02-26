@@ -6,18 +6,18 @@ import signal
 
 from hail.config import get_settings
 from hail.logging_utils import setup_logging
-from hail.place_once_engine import PlaceOnceEngine
+from hail.po.engine import PoEngine
 
 
 async def _run() -> None:
     settings = get_settings()
     setup_logging(settings)
 
-    engine = PlaceOnceEngine(settings)
+    engine = PoEngine(settings)
     loop = asyncio.get_running_loop()
 
     def _handle_stop() -> None:
-        logging.info("Stop signal received, shutting down place-once engine.")
+        logging.info("Stop signal received, shutting down PO engine.")
         engine.stop()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
