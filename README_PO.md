@@ -16,6 +16,45 @@ PO is the place-once strategy.
 - Logs summary stats every 5 minutes.
 - Sends per-market resolution Telegram updates and a 24h Telegram report.
 
+## Flow
+
+```mermaid
+flowchart TD
+    startup[Startup] --> scanLoop[Scan and place loop]
+    startup --> fillLoop[Fill reconcile loop]
+    startup --> resolveLoop[Resolution loop]
+    startup --> statsLoop[5-minute stats loop]
+    startup --> dailyLoop[24-hour report loop]
+    startup --> announceLoop[Per-market announce loop]
+
+    scanLoop --> discovered{New market and never entered?}
+    discovered -- no --> scanSleep[Sleep]
+    discovered -- yes --> readBooks[Read YES and NO best bid]
+    readBooks --> priceCalc[Target price = best bid minus PO_PRICE_TICK]
+    priceCalc --> placePair[Place 2 GTC BUY orders YES and NO]
+    placePair --> markEntered[Persist market as entered forever]
+    markEntered --> scanSleep
+    scanSleep --> scanLoop
+
+    fillLoop --> pollOrders[Poll posted order status and filled size]
+    pollOrders --> updateOrders[Update po_orders and fill summaries]
+    updateOrders --> fillSleep[Sleep]
+    fillSleep --> fillLoop
+
+    resolveLoop --> endedMarkets[Find ended unresolved entered markets]
+    endedMarkets --> resolved{Resolution found from API?}
+    resolved -- no --> resolveSleep[Sleep]
+    resolved -- yes --> pnlCalc[Compute market pnl from actual fills]
+    pnlCalc --> finalize[Finalize market result and update counters]
+    finalize --> resolveSleep
+    resolveSleep --> resolveLoop
+
+    announceLoop --> pendingMsgs[Load unannounced finalized markets]
+    pendingMsgs --> sendMsgs[Send Telegram per market]
+    sendMsgs --> markMsgs[Mark announced]
+    markMsgs --> announceLoop
+```
+
 ## Run
 
 ```bash
