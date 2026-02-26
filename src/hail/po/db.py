@@ -277,6 +277,8 @@ class PoDatabase:
                 o.condition_id,
                 o.filled_size,
                 o.status,
+                o.outcome,
+                o.price,
                 m.symbol,
                 m.window_minutes,
                 m.end_time
@@ -296,9 +298,11 @@ class PoDatabase:
                 "condition_id": str(row[2]),
                 "filled_size": float(row[3]),
                 "status": str(row[4]),
-                "symbol": None if row[5] is None else str(row[5]),
-                "window_minutes": None if row[6] is None else int(row[6]),
-                "end_time": None if row[7] is None else str(row[7]),
+                "outcome": str(row[5]),
+                "price": float(row[6]),
+                "symbol": None if row[7] is None else str(row[7]),
+                "window_minutes": None if row[8] is None else int(row[8]),
+                "end_time": None if row[9] is None else str(row[9]),
             }
             for row in rows
         ]

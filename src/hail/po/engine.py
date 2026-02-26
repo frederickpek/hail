@@ -18,8 +18,10 @@ from hail.polymarket_trader import PolymarketTrader
 from hail.polymarket_ws import PolymarketBookFeed
 from hail.telegram_notifier import TelegramNotifier
 
-PO_ORDER_POST_ATTEMPTS = 2
+PO_ORDER_POST_ATTEMPTS = 1
 PO_ORDER_RETRY_DELAY_SECONDS = 1.0
+PO_CANCEL_CONFIRM_ATTEMPTS = 5
+PO_CANCEL_CONFIRM_DELAY_SECONDS = 1.0
 
 
 class PoEngine:
@@ -205,20 +207,31 @@ class PoEngine:
                 market=market,
                 failed_outcome="YES",
             )
-        end_time_sg = market.end_time.astimezone(ZoneInfo("Asia/Singapore"))
-        end_time_display = (
-            f"{end_time_sg.day} {end_time_sg.strftime('%b')} "
-            f"{end_time_sg.strftime('%-I:%M%p').lower()}"
-        )
-        market_display = f"{market.symbol} {market.window_minutes}m, {end_time_display}"
-        logging.info(
-            "✅ Entered market once: %s yes_price=%.4f no_price=%.4f size=%.4f condition=%s",
-            market_display,
-            yes_price,
-            no_price,
-            size,
-            market.condition_id,
-        )
+        if yes_exchange_order_id and no_exchange_order_id:
+            end_time_sg = market.end_time.astimezone(ZoneInfo("Asia/Singapore"))
+            end_time_display = (
+                f"{end_time_sg.day} {end_time_sg.strftime('%b')} "
+                f"{end_time_sg.strftime('%-I:%M%p').lower()}"
+            )
+            market_display = f"{market.symbol} {market.window_minutes}m, {end_time_display}"
+            logging.info(
+                "✅ Entered market once: %s yes_price=%.4f no_price=%.4f size=%.4f condition=%s",
+                market_display,
+                yes_price,
+                no_price,
+                size,
+                market.condition_id,
+            )
+        else:
+            logging.warning(
+                (
+                    "Skipped entered-market log: pair not fully posted "
+                    "condition=%s yes_posted=%s no_posted=%s"
+                ),
+                market.condition_id,
+                bool(yes_exchange_order_id),
+                bool(no_exchange_order_id),
+            )
 
     async def _submit_order_with_retry(self, order: PoOrder, market: MarketDefinition) -> tuple[int, str | None]:
         row_id = await self._db.record_order_created(order)
@@ -263,16 +276,29 @@ class PoEngine:
     ) -> None:
         cancelled = self._trader.cancel_order(exchange_order_id)
         if cancelled:
-            await self._db.mark_order_status(row_id, "CANCEL_REQUESTED")
-            logging.warning(
-                (
-                    "Cancelled paired posted order after opposite leg failure: "
-                    "condition=%s failed_outcome=%s cancelled_order_id=%s"
-                ),
-                market.condition_id,
-                failed_outcome,
-                exchange_order_id,
-            )
+            confirmed_cancelled = await self._confirm_order_cancelled(exchange_order_id)
+            if confirmed_cancelled:
+                await self._db.mark_order_status(row_id, "CANCELLED")
+                logging.warning(
+                    (
+                        "Cancelled paired posted order after opposite leg failure: "
+                        "condition=%s failed_outcome=%s cancelled_order_id=%s confirmed=true"
+                    ),
+                    market.condition_id,
+                    failed_outcome,
+                    exchange_order_id,
+                )
+            else:
+                await self._db.mark_order_status(row_id, "CANCEL_REQUESTED")
+                logging.warning(
+                    (
+                        "Cancel requested for paired posted order but not yet confirmed: "
+                        "condition=%s failed_outcome=%s order_id=%s"
+                    ),
+                    market.condition_id,
+                    failed_outcome,
+                    exchange_order_id,
+                )
             return
 
         await self._db.mark_order_status(row_id, "CANCEL_FAILED")
@@ -285,6 +311,26 @@ class PoEngine:
             failed_outcome,
             exchange_order_id,
         )
+
+    async def _confirm_order_cancelled(self, exchange_order_id: str) -> bool:
+        for _ in range(PO_CANCEL_CONFIRM_ATTEMPTS):
+            snapshot = self._trader.get_order_fill_snapshot(exchange_order_id)
+            if snapshot is not None:
+                _filled_size, status = snapshot
+                normalized_status = (status or "").upper()
+                if normalized_status in {"CANCELED", "CANCELLED"}:
+                    logging.info("Cancel confirmed for order_id=%s status=%s", exchange_order_id, normalized_status)
+                    return True
+                if normalized_status in {"FILLED", "MATCHED"}:
+                    logging.warning(
+                        "Cancel check saw order already filled order_id=%s status=%s",
+                        exchange_order_id,
+                        normalized_status,
+                    )
+                    return False
+            await asyncio.sleep(PO_CANCEL_CONFIRM_DELAY_SECONDS)
+        logging.warning("Cancel not confirmed after retries order_id=%s", exchange_order_id)
+        return False
 
     async def _fill_reconcile_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -310,10 +356,13 @@ class PoEngine:
                         logging.info(
                             (
                                 "PO fill update: market=%s "
+                                "outcome=%s fill_price=%.4f "
                                 "delta=%.6f total=%.6f status=%s->%s "
                                 "condition=%s order_id=%s"
                             ),
                             market_display,
+                            order.get("outcome"),
+                            float(order.get("price", 0.0)),
                             fill_delta,
                             current_filled,
                             previous_status,

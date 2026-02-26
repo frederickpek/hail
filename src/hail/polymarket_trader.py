@@ -254,8 +254,8 @@ class PolymarketTrader:
         if self._client is None:
             return False
         try:
-            self._client.cancel(order_id)
-            logging.info("Cancel request sent for order_id=%s", order_id)
+            response = self._client.cancel(order_id)
+            logging.info("Cancel request sent for order_id=%s response=%s", order_id, response)
             return True
         except PolyApiException as exc:
             logging.warning("Cancel failed for order_id=%s: %s", order_id, exc)

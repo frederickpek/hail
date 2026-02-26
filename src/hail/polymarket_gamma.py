@@ -37,9 +37,21 @@ class GammaMarketScanner:
         timeout = httpx.Timeout(self._settings.request_timeout_seconds)
         all_rows: list[dict] = []
         seen_ids: set[str] = set()
+        scan_windows: list[int] = []
+        seen_windows: set[int] = set()
+        for minutes in self._settings.target_windows_minutes:
+            if minutes <= 0:
+                continue
+            if minutes in seen_windows:
+                continue
+            seen_windows.add(minutes)
+            scan_windows.append(minutes)
+        if not scan_windows:
+            logging.warning("gamma scan skipped: TARGET_WINDOWS_MINUTES has no positive values")
+            return []
         async with httpx.AsyncClient(timeout=timeout) as client:
-            for tag_slug in ["5m", "15m"]:
-                minutes = int(tag_slug.replace("m", ""))
+            for minutes in scan_windows:
+                tag_slug = f"{minutes}m"
                 end_date_max = (now + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
                 params = {
                     "limit": "50",
@@ -65,10 +77,9 @@ class GammaMarketScanner:
                 except httpx.HTTPStatusError as exc:
                     body = exc.response.text[:300] if exc.response is not None else ""
                     logging.warning(
-                        "gamma scan request[tag=%s] failed: status=%s body=%s",
+                        "gamma scan request[tag=%s] failed: status=%s",
                         tag_slug,
                         exc.response.status_code if exc.response is not None else "unknown",
-                        body,
                     )
                     continue
 
