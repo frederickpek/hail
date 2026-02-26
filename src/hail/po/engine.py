@@ -184,10 +184,19 @@ class PoEngine:
             size=size,
             reason="po_no_bid_shared_offset",
         )
+        market_display = self._format_market_display(
+            symbol=market.symbol,
+            window_minutes=market.window_minutes,
+            end_time_iso=market.end_time.isoformat(),
+        )
         yes_row_id, yes_exchange_order_id = await self._submit_order_with_retry(yes_order, market)
         if yes_exchange_order_id is None and not self._settings.po_dry_run:
             logging.warning(
-                "Skipping paired NO order because YES leg failed after retry: condition=%s",
+                (
+                    "Skipping paired order after leg failure: market=%s "
+                    "failed_outcome=YES skipped_outcome=NO condition=%s"
+                ),
+                market_display,
                 market.condition_id,
             )
             return
@@ -208,12 +217,6 @@ class PoEngine:
                 failed_outcome="YES",
             )
         if yes_exchange_order_id and no_exchange_order_id:
-            end_time_sg = market.end_time.astimezone(ZoneInfo("Asia/Singapore"))
-            end_time_display = (
-                f"{end_time_sg.day} {end_time_sg.strftime('%b')} "
-                f"{end_time_sg.strftime('%-I:%M%p').lower()}"
-            )
-            market_display = f"{market.symbol} {market.window_minutes}m, {end_time_display}"
             logging.info(
                 "✅ Entered market once: %s yes_price=%.4f no_price=%.4f size=%.4f condition=%s",
                 market_display,
@@ -221,16 +224,6 @@ class PoEngine:
                 no_price,
                 size,
                 market.condition_id,
-            )
-        else:
-            logging.warning(
-                (
-                    "Skipped entered-market log: pair not fully posted "
-                    "condition=%s yes_posted=%s no_posted=%s"
-                ),
-                market.condition_id,
-                bool(yes_exchange_order_id),
-                bool(no_exchange_order_id),
             )
 
     async def _submit_order_with_retry(self, order: PoOrder, market: MarketDefinition) -> tuple[int, str | None]:
@@ -419,7 +412,8 @@ class PoEngine:
                         except ValueError:
                             end_time = now
 
-                        if (now - end_time).total_seconds() > (20 * 60):
+                        pnl = float(row["pnl"])
+                        if (now - end_time).total_seconds() > (20 * 60) or not pnl:
                             await self._db.mark_result_announced(row["condition_id"])
                             continue
 
@@ -428,7 +422,6 @@ class PoEngine:
                             window_minutes=row.get("window_minutes"),
                             end_time_iso=row.get("end_time"),
                         )
-                        pnl = float(row["pnl"])
                         icon = "✅" if pnl > 0 else "❌"
                         message = (
                             f"{icon} {market_display} resolved={row['resolved_side']} "

@@ -84,18 +84,28 @@ class PolymarketTrader:
         else:
             raise ValueError(f"Unsupported side: {intent.side}")
 
+        end_time_sg = market.end_time.astimezone(ZoneInfo("Asia/Singapore"))
+        end_time_display = (
+            f"{end_time_sg.day} {end_time_sg.strftime('%b')} "
+            f"{end_time_sg.strftime('%-I:%M%p').lower()}"
+        )
+        market_display = f"{market.symbol} {market.window_minutes}m, {end_time_display}"
+        outcome_side = "YES" if intent.token_id == market.yes_token_id else "NO"
+
         submit_size = self._normalize_order_size(intent)
         if intent.reason.startswith("po_") and abs(submit_size - float(intent.size)) > 1e-9:
             logging.warning(
                 (
-                    "Rejecting PO order due to size deviation: condition=%s token=%s "
-                    "requested_size=%.6f normalized_size=%.6f price=%.4f"
+                    "Rejecting PO order due to size deviation: market=%s outcome=%s "
+                    "requested_size=%.6f normalized_size=%.6f price=%.4f condition=%s token=%s"
                 ),
-                intent.condition_id,
-                intent.token_id,
+                market_display,
+                outcome_side,
                 float(intent.size),
                 submit_size,
                 float(intent.price),
+                intent.condition_id,
+                intent.token_id,
             )
             return None
 
@@ -105,13 +115,6 @@ class PolymarketTrader:
             size=submit_size,
             side=side,
         )
-        end_time_sg = market.end_time.astimezone(ZoneInfo("Asia/Singapore"))
-        end_time_display = (
-            f"{end_time_sg.day} {end_time_sg.strftime('%b')} "
-            f"{end_time_sg.strftime('%-I:%M%p').lower()}"
-        )
-        market_display = f"{market.symbol} {market.window_minutes}m, {end_time_display}"
-        outcome_side = "YES" if intent.token_id == market.yes_token_id else "NO"
         # logging.info(
         #     (
         #         "Order attempt: %s %s market=%s requested_size=%.4f "
@@ -171,10 +174,22 @@ class PolymarketTrader:
                     message,
                 )
             else:
-                logging.error("❌ Order failed for condition=%s: %s", intent.condition_id, exc)
+                logging.error(
+                    "❌ Order failed: market=%s outcome=%s condition=%s error=%s",
+                    market_display,
+                    outcome_side,
+                    intent.condition_id,
+                    exc,
+                )
             return None
         except Exception as exc:  # noqa: BLE001
-            logging.exception("❌ Order failed for condition=%s: %s", intent.condition_id, exc)
+            logging.exception(
+                "❌ Order failed: market=%s outcome=%s condition=%s error=%s",
+                market_display,
+                outcome_side,
+                intent.condition_id,
+                exc,
+            )
             return None
 
     async def place_market_close_order(self, intent: TradeIntent, market: MarketDefinition) -> str | None:
