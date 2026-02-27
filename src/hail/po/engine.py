@@ -23,7 +23,7 @@ PO_ORDER_POST_ATTEMPTS = 1
 PO_ORDER_RETRY_DELAY_SECONDS = 1.0
 PO_CANCEL_CONFIRM_ATTEMPTS = 5
 PO_CANCEL_CONFIRM_DELAY_SECONDS = 1.0
-PO_CLAIM_LOOP_INTERVAL_SECONDS = 300
+PO_CLAIM_LOOP_INTERVAL_SECONDS = 150
 
 
 class PoEngine:
@@ -217,6 +217,8 @@ class PoEngine:
                 exchange_order_id=yes_exchange_order_id,
                 market=market,
                 failed_outcome="NO",
+                posted_outcome="YES",
+                posted_token_id=market.yes_token_id,
             )
         elif no_exchange_order_id and not yes_exchange_order_id:
             await self._cancel_posted_leg(
@@ -224,6 +226,8 @@ class PoEngine:
                 exchange_order_id=no_exchange_order_id,
                 market=market,
                 failed_outcome="YES",
+                posted_outcome="NO",
+                posted_token_id=market.no_token_id,
             )
         if yes_exchange_order_id and no_exchange_order_id:
             logging.info(
@@ -275,11 +279,13 @@ class PoEngine:
         exchange_order_id: str,
         market: MarketDefinition,
         failed_outcome: str,
+        posted_outcome: str,
+        posted_token_id: str,
     ) -> None:
         cancelled = self._trader.cancel_order(exchange_order_id)
         if cancelled:
-            confirmed_cancelled = await self._confirm_order_cancelled(exchange_order_id)
-            if confirmed_cancelled:
+            cancel_state, observed_filled_size = await self._confirm_order_cancelled(exchange_order_id)
+            if cancel_state == "CANCELLED":
                 await self._db.mark_order_status(row_id, "CANCELLED")
                 logging.warning(
                     (
@@ -289,6 +295,30 @@ class PoEngine:
                     market.condition_id,
                     failed_outcome,
                     exchange_order_id,
+                )
+            elif cancel_state == "FILLED":
+                await self._db.upsert_order_snapshot(
+                    exchange_order_id=exchange_order_id,
+                    new_status="FILLED",
+                    new_filled_size=max(observed_filled_size, 0.0),
+                )
+                logging.warning(
+                    (
+                        "Paired order already filled before cancel could apply; "
+                        "triggering market close hedge: condition=%s filled_outcome=%s "
+                        "failed_outcome=%s order_id=%s filled_size=%.6f"
+                    ),
+                    market.condition_id,
+                    posted_outcome,
+                    failed_outcome,
+                    exchange_order_id,
+                    max(observed_filled_size, 0.0),
+                )
+                await self._market_close_unhedged_leg(
+                    market=market,
+                    token_id=posted_token_id,
+                    outcome=posted_outcome,
+                    size=max(observed_filled_size, 0.0),
                 )
             else:
                 await self._db.mark_order_status(row_id, "CANCEL_REQUESTED")
@@ -314,25 +344,72 @@ class PoEngine:
             exchange_order_id,
         )
 
-    async def _confirm_order_cancelled(self, exchange_order_id: str) -> bool:
+    async def _confirm_order_cancelled(self, exchange_order_id: str) -> tuple[str, float]:
         for _ in range(PO_CANCEL_CONFIRM_ATTEMPTS):
             snapshot = self._trader.get_order_fill_snapshot(exchange_order_id)
             if snapshot is not None:
-                _filled_size, status = snapshot
+                filled_size, status = snapshot
                 normalized_status = (status or "").upper()
                 if normalized_status in {"CANCELED", "CANCELLED"}:
                     logging.info("Cancel confirmed for order_id=%s status=%s", exchange_order_id, normalized_status)
-                    return True
+                    return "CANCELLED", max(filled_size, 0.0)
                 if normalized_status in {"FILLED", "MATCHED"}:
                     logging.warning(
                         "Cancel check saw order already filled order_id=%s status=%s",
                         exchange_order_id,
                         normalized_status,
                     )
-                    return False
+                    return "FILLED", max(filled_size, 0.0)
             await asyncio.sleep(PO_CANCEL_CONFIRM_DELAY_SECONDS)
         logging.warning("Cancel not confirmed after retries order_id=%s", exchange_order_id)
-        return False
+        return "UNKNOWN", 0.0
+
+    async def _market_close_unhedged_leg(
+        self,
+        *,
+        market: MarketDefinition,
+        token_id: str,
+        outcome: str,
+        size: float,
+    ) -> None:
+        close_size = max(size, 0.0)
+        if close_size <= 1e-9:
+            logging.warning(
+                "Skip market close hedge due to empty filled size: condition=%s outcome=%s",
+                market.condition_id,
+                outcome,
+            )
+            return
+        intent = TradeIntent(
+            condition_id=market.condition_id,
+            token_id=token_id,
+            side="SELL",
+            price=0.0,
+            size=close_size,
+            reason="po_unhedged_filled_leg_market_close",
+        )
+        order_id = await self._trader.place_market_close_order(intent, market)
+        if order_id:
+            logging.warning(
+                (
+                    "Market close hedge posted for unhedged filled leg: "
+                    "condition=%s outcome=%s size=%.6f order_id=%s"
+                ),
+                market.condition_id,
+                outcome,
+                close_size,
+                order_id,
+            )
+            return
+        logging.error(
+            (
+                "Market close hedge failed for unhedged filled leg: "
+                "condition=%s outcome=%s size=%.6f"
+            ),
+            market.condition_id,
+            outcome,
+            close_size,
+        )
 
     async def _fill_reconcile_loop(self) -> None:
         while not self._stop_event.is_set():

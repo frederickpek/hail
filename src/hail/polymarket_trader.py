@@ -14,7 +14,7 @@ from hail.config import Settings
 from hail.models import MarketDefinition, TradeIntent
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import AssetType, BalanceAllowanceParams, MarketOrderArgs, OrderArgs, OrderType
+from py_clob_client.clob_types import AssetType, BalanceAllowanceParams, MarketOrderArgs, OpenOrderParams, OrderArgs, OrderType
 from py_clob_client.exceptions import PolyApiException
 from py_clob_client.order_builder.constants import BUY, SELL
 from py_builder_relayer_client.client import RelayClient
@@ -131,6 +131,7 @@ class PolymarketTrader:
             size=submit_size,
             side=side,
         )
+        attempt_started_epoch = int(time.time())
         # logging.info(
         #     (
         #         "Order attempt: %s %s market=%s requested_size=%.4f "
@@ -163,7 +164,16 @@ class PolymarketTrader:
                 intent.price,
                 order_id,
             )
-            return str(order_id) if order_id else None
+            if order_id:
+                return str(order_id)
+            recovered = self._recover_order_id_after_submit_failure(
+                intent=intent,
+                market_display=market_display,
+                outcome_side=outcome_side,
+                submit_size=args.size,
+                attempt_started_epoch=attempt_started_epoch,
+            )
+            return recovered
         except PolyApiException as exc:
             message = str(exc)
             if "not enough balance / allowance" in message.lower():
@@ -197,7 +207,14 @@ class PolymarketTrader:
                     intent.condition_id,
                     exc,
                 )
-            return None
+            recovered = self._recover_order_id_after_submit_failure(
+                intent=intent,
+                market_display=market_display,
+                outcome_side=outcome_side,
+                submit_size=args.size,
+                attempt_started_epoch=attempt_started_epoch,
+            )
+            return recovered
         except Exception as exc:  # noqa: BLE001
             logging.exception(
                 "❌ Order failed: market=%s outcome=%s condition=%s error=%s",
@@ -206,7 +223,14 @@ class PolymarketTrader:
                 intent.condition_id,
                 exc,
             )
-            return None
+            recovered = self._recover_order_id_after_submit_failure(
+                intent=intent,
+                market_display=market_display,
+                outcome_side=outcome_side,
+                submit_size=args.size,
+                attempt_started_epoch=attempt_started_epoch,
+            )
+            return recovered
 
     async def place_market_close_order(self, intent: TradeIntent, market: MarketDefinition) -> str | None:
         if self._client is None:
@@ -428,6 +452,64 @@ class PolymarketTrader:
             return float(value)
         except (TypeError, ValueError):
             return 0.0
+
+    def _recover_order_id_after_submit_failure(
+        self,
+        *,
+        intent: TradeIntent,
+        market_display: str,
+        outcome_side: str,
+        submit_size: float,
+        attempt_started_epoch: int,
+    ) -> str | None:
+        if self._client is None:
+            return None
+        try:
+            orders = self._client.get_orders(OpenOrderParams(asset_id=intent.token_id))
+        except Exception as exc:  # noqa: BLE001
+            logging.warning(
+                "Order recovery lookup failed: market=%s outcome=%s condition=%s error=%s",
+                market_display,
+                outcome_side,
+                intent.condition_id,
+                exc,
+            )
+            return None
+
+        target_side = intent.side.upper()
+        target_price = round(float(intent.price), 4)
+        target_size = round(float(submit_size), SIZE_DECIMAL_PLACES)
+        for order in orders:
+            order_id = str(order.get("id") or "")
+            if not order_id:
+                continue
+            order_side = str(order.get("side") or "").upper()
+            if order_side != target_side:
+                continue
+            order_price = round(self._safe_float(order.get("price")), 4)
+            if abs(order_price - target_price) > 1e-9:
+                continue
+            order_size = round(
+                self._safe_float(order.get("original_size") or order.get("size") or 0),
+                SIZE_DECIMAL_PLACES,
+            )
+            if abs(order_size - target_size) > 1e-6:
+                continue
+            created_at = int(self._safe_float(order.get("created_at") or 0))
+            if created_at and created_at < (attempt_started_epoch - 5):
+                continue
+            logging.warning(
+                (
+                    "Recovered posted order after submit failure: market=%s outcome=%s "
+                    "condition=%s order_id=%s"
+                ),
+                market_display,
+                outcome_side,
+                intent.condition_id,
+                order_id,
+            )
+            return order_id
+        return None
 
     def _normalize_order_size(self, intent: TradeIntent) -> float:
         size = max(float(intent.size), 0.0)
