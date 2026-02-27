@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from time import monotonic
 from zoneinfo import ZoneInfo
 from typing import Any
 
@@ -22,6 +23,7 @@ PO_ORDER_POST_ATTEMPTS = 1
 PO_ORDER_RETRY_DELAY_SECONDS = 1.0
 PO_CANCEL_CONFIRM_ATTEMPTS = 5
 PO_CANCEL_CONFIRM_DELAY_SECONDS = 1.0
+PO_CLAIM_LOOP_INTERVAL_SECONDS = 300
 
 
 class PoEngine:
@@ -35,6 +37,7 @@ class PoEngine:
         self._states: dict[str, MarketState] = {}
         self._token_to_market: dict[str, tuple[str, str]] = {}
         self._entered_condition_ids: set[str] = set()
+        self._claim_tasks: dict[str, asyncio.Task[None]] = {}
 
         self._stop_event = asyncio.Event()
         self._book_feed = PolymarketBookFeed(settings, self._on_book_update)
@@ -55,6 +58,7 @@ class PoEngine:
             asyncio.create_task(self._scan_place_loop(), name="po-scan-place-loop"),
             asyncio.create_task(self._fill_reconcile_loop(), name="po-fill-reconcile-loop"),
             asyncio.create_task(self._resolution_loop(), name="po-resolution-loop"),
+            asyncio.create_task(self._claim_loop(), name="po-claim-loop"),
             asyncio.create_task(self._stats_loop(), name="po-stats-loop"),
             asyncio.create_task(self._daily_report_loop(), name="po-daily-report-loop"),
             asyncio.create_task(self._result_announce_loop(), name="po-result-announce-loop"),
@@ -66,6 +70,10 @@ class PoEngine:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            for task in self._claim_tasks.values():
+                task.cancel()
+            if self._claim_tasks:
+                await asyncio.gather(*self._claim_tasks.values(), return_exceptions=True)
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -85,13 +93,14 @@ class PoEngine:
 
     async def _scan_place_loop(self) -> None:
         while not self._stop_event.is_set():
+            loop_started_at = monotonic()
             try:
                 markets = await self._scanner.scan()
                 await self._register_markets(markets)
                 await self._place_for_new_markets()
             except Exception as exc:  # noqa: BLE001
                 logging.warning("po scan/place loop error: %s", exc)
-            await asyncio.sleep(self._settings.po_scan_interval_seconds)
+            await self._sleep_remaining(loop_started_at, self._settings.po_scan_interval_seconds)
 
     async def _register_markets(self, markets: list[MarketDefinition]) -> None:
         now = datetime.now(tz=timezone.utc)
@@ -327,6 +336,7 @@ class PoEngine:
 
     async def _fill_reconcile_loop(self) -> None:
         while not self._stop_event.is_set():
+            loop_started_at = monotonic()
             try:
                 orders = await self._db.list_orders_for_reconcile()
                 for order in orders:
@@ -370,10 +380,11 @@ class PoEngine:
                     )
             except Exception as exc:  # noqa: BLE001
                 logging.warning("po fill reconcile error: %s", exc)
-            await asyncio.sleep(self._settings.po_fill_poll_interval_seconds)
+            await self._sleep_remaining(loop_started_at, self._settings.po_fill_poll_interval_seconds)
 
     async def _resolution_loop(self) -> None:
         while not self._stop_event.is_set():
+            loop_started_at = monotonic()
             try:
                 now_iso = datetime.now(tz=timezone.utc).isoformat()
                 pending = await self._db.list_markets_pending_resolution(now_iso)
@@ -395,10 +406,68 @@ class PoEngine:
                     )
             except Exception as exc:  # noqa: BLE001
                 logging.warning("po resolution loop error: %s", exc)
-            await asyncio.sleep(self._settings.po_resolution_poll_interval_seconds)
+            await self._sleep_remaining(loop_started_at, self._settings.po_resolution_poll_interval_seconds)
+
+    async def _claim_loop(self) -> None:
+        while not self._stop_event.is_set():
+            loop_started_at = monotonic()
+            try:
+                now_dt = datetime.now(tz=timezone.utc)
+                window_start_dt = now_dt - timedelta(minutes=30)
+                claim_candidates = await self._db.list_markets_pending_claim(
+                    window_start_iso=window_start_dt.isoformat(),
+                    now_iso=now_dt.isoformat(),
+                )
+                enqueued = 0
+                # Clean up finished tasks from the inflight map.
+                for condition_id, task in list(self._claim_tasks.items()):
+                    if task.done():
+                        self._claim_tasks.pop(condition_id, None)
+                for market in claim_candidates:
+                    condition_id = market.condition_id
+                    if condition_id in self._claim_tasks:
+                        continue
+                    task = asyncio.create_task(
+                        self._claim_market_task(market),
+                        name=f"po-claim-{condition_id[:8]}",
+                    )
+                    self._claim_tasks[condition_id] = task
+                    enqueued += 1
+                logging.info(
+                    (
+                        "PO claim loop: window_start=%s window_end=%s "
+                        "candidates=%s enqueued=%s inflight=%s mode=%s"
+                    ),
+                    window_start_dt.isoformat(),
+                    now_dt.isoformat(),
+                    len(claim_candidates),
+                    enqueued,
+                    len(self._claim_tasks),
+                    "relayer" if self._trader.relayer_enabled else "direct",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("po claim loop error: %s", exc)
+            await self._sleep_remaining(loop_started_at, PO_CLAIM_LOOP_INTERVAL_SECONDS)
+
+    async def _claim_market_task(self, market: MarketDefinition) -> None:
+        condition_id = market.condition_id
+        try:
+            if self._trader.relayer_enabled:
+                claimed = await self._trader.claim_market_via_relayer(market, wait_for_confirmation=True)
+            else:
+                claimed_ids = await self._trader.claim_condition_ids_if_resolved([market])
+                claimed = condition_id in claimed_ids
+            if claimed:
+                await self._db.mark_market_claimed(condition_id)
+                logging.info("PO claim marked successful: condition=%s", condition_id)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("PO claim task error: condition=%s error=%s", condition_id, exc)
+        finally:
+            self._claim_tasks.pop(condition_id, None)
 
     async def _result_announce_loop(self) -> None:
         while not self._stop_event.is_set():
+            loop_started_at = monotonic()
             try:
                 if self._notifier.enabled:
                     rows = await self._db.list_unannounced_results(limit=10)
@@ -413,7 +482,7 @@ class PoEngine:
                             end_time = now
 
                         pnl = float(row["pnl"])
-                        if (now - end_time).total_seconds() > (20 * 60) or not pnl:
+                        if (now - end_time).total_seconds() > (30 * 60) or not pnl:
                             await self._db.mark_result_announced(row["condition_id"])
                             continue
 
@@ -434,24 +503,31 @@ class PoEngine:
                         await asyncio.sleep(1)
             except Exception as exc:  # noqa: BLE001
                 logging.warning("po result announce loop error: %s", exc)
-            await asyncio.sleep(30)
+            await self._sleep_remaining(loop_started_at, 30)
 
     async def _stats_loop(self) -> None:
         while not self._stop_event.is_set():
+            loop_started_at = monotonic()
             try:
                 await self._log_stats_snapshot()
             except Exception as exc:  # noqa: BLE001
                 logging.warning("po stats loop error: %s", exc)
-            await asyncio.sleep(self._settings.po_stats_interval_seconds)
+            await self._sleep_remaining(loop_started_at, self._settings.po_stats_interval_seconds)
 
     async def _daily_report_loop(self) -> None:
         while not self._stop_event.is_set():
+            loop_started_at = monotonic()
             try:
                 async with self._daily_lock:
                     await self._send_daily_report()
             except Exception as exc:  # noqa: BLE001
                 logging.warning("po daily report loop error: %s", exc)
-            await asyncio.sleep(self._settings.po_daily_report_interval_seconds)
+            await self._sleep_remaining(loop_started_at, self._settings.po_daily_report_interval_seconds)
+
+    async def _sleep_remaining(self, loop_started_at: float, interval_seconds: float) -> None:
+        remaining = float(interval_seconds) - (monotonic() - loop_started_at)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
 
     async def _send_daily_report(self) -> None:
         stats = await self._db.get_stats()

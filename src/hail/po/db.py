@@ -8,7 +8,14 @@ import aiosqlite
 from hail.models import MarketDefinition
 from hail.po.models import MarketFillSummary, PoOrder
 
-TERMINAL_ORDER_STATUSES = {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}
+TERMINAL_ORDER_STATUSES = {
+    "FILLED",
+    "CANCELED",
+    "CANCELLED",
+    "REJECTED",
+    "EXPIRED",
+    "CANCELED_MARKET_RESOLVED",
+}
 
 
 def utc_now_iso() -> str:
@@ -120,6 +127,11 @@ class PoDatabase:
                     combined_markets_total INTEGER NOT NULL,
                     combined_wins_total INTEGER NOT NULL,
                     lifetime_pnl_total REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS po_claim_successes (
+                    condition_id TEXT PRIMARY KEY,
+                    claimed_at TEXT NOT NULL
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_po_orders_condition ON po_orders(condition_id);
@@ -445,6 +457,55 @@ class PoDatabase:
             }
             for row in rows
         ]
+
+    async def list_markets_pending_claim(self, window_start_iso: str, now_iso: str) -> list[MarketDefinition]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                SELECT
+                    m.condition_id, m.slug, m.question, m.symbol, m.window_minutes, m.end_time,
+                    m.yes_token_id, m.no_token_id
+                FROM po_markets m
+                LEFT JOIN po_claim_successes c ON c.condition_id = m.condition_id
+                WHERE m.end_time BETWEEN ? AND ?
+                  AND (yes_filled_qty > 0 OR no_filled_qty > 0)
+                  AND c.condition_id IS NULL
+                ORDER BY m.end_time ASC
+                """,
+                (window_start_iso, now_iso),
+            )
+            rows = await cursor.fetchall()
+        markets: list[MarketDefinition] = []
+        for row in rows:
+            try:
+                end_time = datetime.fromisoformat(str(row[5]).replace("Z", "+00:00")).astimezone(timezone.utc)
+            except ValueError:
+                continue
+            markets.append(
+                MarketDefinition(
+                    condition_id=str(row[0]),
+                    slug=str(row[1]),
+                    question=str(row[2]),
+                    symbol=str(row[3]),
+                    window_minutes=int(row[4]),
+                    strike=0.0,
+                    end_time=end_time,
+                    yes_token_id=str(row[6]),
+                    no_token_id=str(row[7]),
+                )
+            )
+        return markets
+
+    async def mark_market_claimed(self, condition_id: str) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO po_claim_successes (condition_id, claimed_at)
+                VALUES (?, ?)
+                """,
+                (condition_id, utc_now_iso()),
+            )
+            await db.commit()
 
     async def get_market_fill_summary(self, condition_id: str) -> MarketFillSummary:
         async with aiosqlite.connect(self.db_path) as db:

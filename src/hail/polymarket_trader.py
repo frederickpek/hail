@@ -7,6 +7,7 @@ from time import monotonic
 from typing import Any
 from zoneinfo import ZoneInfo
 import asyncio
+from datetime import timedelta, timezone
 
 from hail.config import Settings
 from hail.models import MarketDefinition, TradeIntent
@@ -15,6 +16,10 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import AssetType, BalanceAllowanceParams, MarketOrderArgs, OrderArgs, OrderType
 from py_clob_client.exceptions import PolyApiException
 from py_clob_client.order_builder.constants import BUY, SELL
+from py_builder_relayer_client.client import RelayClient
+from py_builder_relayer_client.models import OperationType, SafeTransaction
+from py_builder_signing_sdk.config import BuilderConfig
+from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
 from web3 import Web3
 
 MIN_MARKETABLE_BUY_NOTIONAL = 1.1
@@ -26,6 +31,8 @@ SELL_SIZE_FACTOR = Decimal("0.9")
 BALANCE_REJECTION_COOLDOWN_SECONDS = 20.0
 CTF_CONTRACT_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 USDC_COLLATERAL_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+CLAIM_DIRECT_REDEEM_DELAY_MINUTES = 5
+RELAYER_URL = "https://relayer-v2.polymarket.com"
 
 
 class PolymarketTrader:
@@ -39,6 +46,7 @@ class PolymarketTrader:
         self._sell_reduction_tokens: set[str] = set()
         self._web3: Web3 | None = None
         self._signer_address: str | None = None
+        self._relay_client: RelayClient | None = None
 
     async def connect(self) -> None:
         if not self._settings.private_key:
@@ -70,7 +78,12 @@ class PolymarketTrader:
         )
         logging.info("Polymarket trader connected")
         self._init_claim_client()
+        self._init_relayer_client()
         self._log_collateral_balance()
+
+    @property
+    def relayer_enabled(self) -> bool:
+        return self._relay_client is not None
 
     async def place_limit_order(self, intent: TradeIntent, market: MarketDefinition) -> str | None:
         if self._client is None or self._order_args_cls is None:
@@ -254,6 +267,9 @@ class PolymarketTrader:
             return None
         try:
             order = self._client.get_order(order_id)
+            if not isinstance(order, dict):
+                logging.debug("Order snapshot unavailable for order_id=%s response=%r", order_id, order)
+                return None
             status_raw = order.get("status", "")
             status = str(status_raw).lower()
             filled_raw = order.get("size_matched")
@@ -483,33 +499,123 @@ class PolymarketTrader:
             self._signer_address = None
             logging.warning("Failed to initialize claim client: %s", exc)
 
-    async def claim_positions_if_resolved(self, markets: list[MarketDefinition]) -> int:
-        if self._web3 is None or not self._settings.private_key or not markets:
-            return 0
-        if self._signer_address is None:
-            return 0
+    def _init_relayer_client(self) -> None:
+        if not self._settings.private_key:
+            return
+        if not self._settings.poly_api_key or not self._settings.poly_api_secret or not self._settings.poly_api_passphrase:
+            logging.info("Relayer claim disabled: missing builder credentials in env")
+            return
+        try:
+            builder_config = BuilderConfig(
+                local_builder_creds=BuilderApiKeyCreds(
+                    key=self._settings.poly_api_key,
+                    secret=self._settings.poly_api_secret,
+                    passphrase=self._settings.poly_api_passphrase,
+                )
+            )
+            self._relay_client = RelayClient(
+                RELAYER_URL,
+                self._settings.poly_chain_id,
+                self._settings.private_key,
+                builder_config,
+            )
+            logging.info("Builder relayer client initialized for claim flow")
+        except Exception as exc:  # noqa: BLE001
+            self._relay_client = None
+            logging.warning("Failed to initialize relayer claim client: %s", exc)
 
-        claimed = 0
+    async def claim_market_via_relayer(self, market: MarketDefinition, wait_for_confirmation: bool = True) -> bool:
+        return await asyncio.to_thread(self._claim_market_via_relayer_sync, market, wait_for_confirmation)
+
+    def _claim_market_via_relayer_sync(self, market: MarketDefinition, wait_for_confirmation: bool) -> bool:
+        if self._relay_client is None:
+            return False
+        yes_balance = self.get_conditional_balance(market.yes_token_id) or 0.0
+        no_balance = self.get_conditional_balance(market.no_token_id) or 0.0
+        if yes_balance <= 0 and no_balance <= 0:
+            return False
+        try:
+            data = self._build_redeem_call_data(market.condition_id)
+            tx = SafeTransaction(
+                to=Web3.to_checksum_address(CTF_CONTRACT_ADDRESS),
+                operation=OperationType.Call,
+                data=data,
+                value="0",
+            )
+            response = self._relay_client.execute([tx], metadata=f"po-redeem-{market.condition_id}")
+            logging.info(
+                "PO relayer claim submitted: condition=%s transaction_id=%s tx_hash=%s",
+                market.condition_id,
+                response.transaction_id,
+                response.transaction_hash,
+            )
+            if wait_for_confirmation:
+                terminal = response.wait()
+                if terminal is None:
+                    logging.warning("PO relayer claim not confirmed: condition=%s", market.condition_id)
+                    return False
+                logging.info(
+                    "PO relayer claim confirmed: condition=%s state=%s tx_hash=%s",
+                    market.condition_id,
+                    terminal.get("state"),
+                    terminal.get("transactionHash"),
+                )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("PO relayer claim failed: condition=%s error=%s", market.condition_id, exc)
+            return False
+
+    async def claim_positions_if_resolved(self, markets: list[MarketDefinition]) -> int:
+        return len(await self.claim_condition_ids_if_resolved(markets))
+
+    async def claim_condition_ids_if_resolved(self, markets: list[MarketDefinition]) -> list[str]:
+        if self._web3 is None or not self._settings.private_key or not markets:
+            return []
+        if self._signer_address is None:
+            return []
+
+        claimed_condition_ids: list[str] = []
         for market in markets:
             try:
                 did_claim = await asyncio.to_thread(self._claim_single_market_sync, market)
                 if did_claim:
-                    claimed += 1
+                    claimed_condition_ids.append(market.condition_id)
             except Exception as exc:  # noqa: BLE001
                 logging.warning(
                     "Claim attempt failed for condition=%s: %s",
                     market.condition_id,
                     exc,
                 )
-        return claimed
+        return claimed_condition_ids
 
     def _claim_single_market_sync(self, market: MarketDefinition) -> bool:
         if self._web3 is None or self._signer_address is None:
             return False
 
-        resolved = self._is_condition_resolved_sync(market.condition_id)
-        if not resolved:
-            return False
+        now_utc = datetime.now(tz=timezone.utc)
+        ended_for = now_utc - market.end_time
+        if ended_for <= timedelta(minutes=CLAIM_DIRECT_REDEEM_DELAY_MINUTES):
+            resolved = self._is_condition_resolved_sync(market.condition_id)
+            if not resolved:
+                logging.info(
+                    "Claim skip (not on-chain resolved): %s %sm condition=%s",
+                    market.symbol,
+                    market.window_minutes,
+                    market.condition_id,
+                )
+                return False
+        else:
+            logging.info(
+                (
+                    "Claim precheck bypassed (> %sm since end): %s %sm "
+                    "condition=%s ended_for_seconds=%.0f"
+                ),
+                CLAIM_DIRECT_REDEEM_DELAY_MINUTES,
+                market.symbol,
+                market.window_minutes,
+                market.condition_id,
+                ended_for.total_seconds(),
+            )
 
         yes_balance = self.get_conditional_balance(market.yes_token_id) or 0.0
         no_balance = self.get_conditional_balance(market.no_token_id) or 0.0
@@ -598,9 +704,49 @@ class PolymarketTrader:
             return False
         try:
             denominator = int(ctf.functions.payoutDenominator(condition_bytes).call())
-            return denominator > 0
+            is_resolved = denominator > 0
+            logging.info(
+                "Claim resolution check: condition=%s payoutDenominator=%s resolved=%s",
+                condition_id,
+                denominator,
+                is_resolved,
+            )
+            return is_resolved
         except Exception:  # noqa: BLE001
             return False
+
+    @staticmethod
+    def _build_redeem_call_data(condition_id: str) -> str:
+        normalized = condition_id[2:] if condition_id.startswith("0x") else condition_id
+        if len(normalized) != 64:
+            raise ValueError(f"invalid condition id: {condition_id}")
+        condition_bytes = bytes.fromhex(normalized)
+        ctf = Web3().eth.contract(
+            address=Web3.to_checksum_address(CTF_CONTRACT_ADDRESS),
+            abi=[
+                {
+                    "inputs": [
+                        {"internalType": "address", "name": "collateralToken", "type": "address"},
+                        {"internalType": "bytes32", "name": "parentCollectionId", "type": "bytes32"},
+                        {"internalType": "bytes32", "name": "conditionId", "type": "bytes32"},
+                        {"internalType": "uint256[]", "name": "indexSets", "type": "uint256[]"},
+                    ],
+                    "name": "redeemPositions",
+                    "outputs": [],
+                    "stateMutability": "nonpayable",
+                    "type": "function",
+                }
+            ],
+        )
+        return ctf.encode_abi(
+            "redeemPositions",
+            args=[
+                Web3.to_checksum_address(USDC_COLLATERAL_ADDRESS),
+                b"\x00" * 32,
+                condition_bytes,
+                [1, 2],
+            ],
+        )
 
     @staticmethod
     def _hex_to_bytes32(value: str) -> bytes | None:

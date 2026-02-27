@@ -13,12 +13,16 @@ dependencies = [
   "python-dotenv>=1.1.1",
   "websockets>=15.0.1",
   "web3>=7.14.1",
+  "py-builder-relayer-client>=0.0.1",
+  "py-builder-signing-sdk>=0.0.2",
 ]
 
 [project.scripts]
 hail = "hail.main:main"
 hail-po = "hail.po.main:main"
 hail-claim-test = "hail.claim_test:main"
+hail-po-claim-now = "hail.po.claim_now:main"
+hail-po-claim-relay-now = "hail.po.claim_relayer_now:main"
 
 [build-system]
 requires = ["hatchling"]
