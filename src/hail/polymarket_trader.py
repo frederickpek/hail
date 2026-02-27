@@ -4,6 +4,7 @@ import logging
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from datetime import datetime
 from time import monotonic
+import time
 from typing import Any
 from zoneinfo import ZoneInfo
 import asyncio
@@ -33,6 +34,8 @@ CTF_CONTRACT_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 USDC_COLLATERAL_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 CLAIM_DIRECT_REDEEM_DELAY_MINUTES = 5
 RELAYER_URL = "https://relayer-v2.polymarket.com"
+RELAYER_WAIT_MAX_POLLS = 30
+RELAYER_WAIT_POLL_SECONDS = 2.0
 
 
 class PolymarketTrader:
@@ -519,6 +522,8 @@ class PolymarketTrader:
                 self._settings.private_key,
                 builder_config,
             )
+            # Keep relayer SDK logs quiet; we surface normalized logs from this app layer.
+            logging.getLogger("py_builder_relayer_client").setLevel(logging.CRITICAL)
             logging.info("Builder relayer client initialized for claim flow")
         except Exception as exc:  # noqa: BLE001
             self._relay_client = None
@@ -550,7 +555,7 @@ class PolymarketTrader:
                 response.transaction_hash,
             )
             if wait_for_confirmation:
-                terminal = response.wait()
+                terminal = self._wait_for_relayer_terminal_state_sync(response.transaction_id)
                 if terminal is None:
                     logging.warning("PO relayer claim not confirmed: condition=%s", market.condition_id)
                     return False
@@ -564,6 +569,26 @@ class PolymarketTrader:
         except Exception as exc:  # noqa: BLE001
             logging.warning("PO relayer claim failed: condition=%s error=%s", market.condition_id, exc)
             return False
+
+    def _wait_for_relayer_terminal_state_sync(self, transaction_id: str) -> dict[str, Any] | None:
+        if self._relay_client is None:
+            return None
+        for _ in range(RELAYER_WAIT_MAX_POLLS):
+            transactions = self._relay_client.get_transaction(transaction_id)
+            if transactions:
+                txn = transactions[0]
+                state = str(txn.get("state") or "")
+                if state in {"STATE_MINED", "STATE_CONFIRMED"}:
+                    return txn
+                if state == "STATE_FAILED":
+                    logging.warning(
+                        "PO relayer claim failed onchain: transaction_id=%s tx_hash=%s",
+                        transaction_id,
+                        txn.get("transactionHash"),
+                    )
+                    return None
+            time.sleep(RELAYER_WAIT_POLL_SECONDS)
+        return None
 
     async def claim_positions_if_resolved(self, markets: list[MarketDefinition]) -> int:
         return len(await self.claim_condition_ids_if_resolved(markets))

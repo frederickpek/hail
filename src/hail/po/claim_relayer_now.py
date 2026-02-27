@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from py_builder_relayer_client.client import RelayClient
 from py_builder_relayer_client.models import OperationType, SafeTransaction
@@ -17,6 +18,8 @@ from hail.po.db import PoDatabase
 from hail.polymarket_trader import CTF_CONTRACT_ADDRESS, USDC_COLLATERAL_ADDRESS
 
 RELAYER_URL = "https://relayer-v2.polymarket.com"
+RELAYER_WAIT_MAX_POLLS = 30
+RELAYER_WAIT_POLL_SECONDS = 2.0
 
 
 def _parse_args() -> argparse.Namespace:
@@ -62,6 +65,25 @@ def _build_redeem_call_data(condition_id: str) -> str:
             }
         ],
     )
+
+
+async def _wait_for_relayer_terminal_state(relay: RelayClient, transaction_id: str) -> dict[str, Any] | None:
+    for _ in range(RELAYER_WAIT_MAX_POLLS):
+        transactions = await asyncio.to_thread(relay.get_transaction, transaction_id)
+        if transactions:
+            txn = transactions[0]
+            state = str(txn.get("state") or "")
+            if state in {"STATE_MINED", "STATE_CONFIRMED"}:
+                return txn
+            if state == "STATE_FAILED":
+                logging.warning(
+                    "PO relayer claim failed onchain: transaction_id=%s tx_hash=%s",
+                    transaction_id,
+                    txn.get("transactionHash"),
+                )
+                return None
+        await asyncio.sleep(RELAYER_WAIT_POLL_SECONDS)
+    return None
     return ctf.encode_abi(
         "redeemPositions",
         args=[
@@ -103,6 +125,7 @@ async def _run() -> int:
         settings.private_key,
         builder_config,
     )
+    logging.getLogger("py_builder_relayer_client").setLevel(logging.CRITICAL)
 
     now_dt = datetime.now(tz=timezone.utc)
     window_start_dt = now_dt - timedelta(minutes=args.minutes)
@@ -149,7 +172,7 @@ async def _run() -> int:
                 response.transaction_hash,
             )
             if args.wait:
-                terminal = response.wait()
+                terminal = await _wait_for_relayer_terminal_state(relay, response.transaction_id)
                 if terminal is None:
                     logging.warning("PO relayer claim not confirmed: condition=%s", market.condition_id)
                     continue
