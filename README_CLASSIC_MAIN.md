@@ -38,7 +38,7 @@ uv sync
 4. Run:
 
 ```bash
-uv run hail
+uv run hail-main
 ```
 
 ## Core Strategy Rules
