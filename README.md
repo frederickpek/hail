@@ -77,6 +77,12 @@ Legacy alias (same PO script):
 uv run hail-po
 ```
 
+## Sample execution logs
+
+When running, you see initialization, market scanning, order placement, fill updates, and claim confirmations:
+
+![Sample execution logs](assets/sample-logs.png)
+
 ## Config
 
 PO settings in `.env`:
