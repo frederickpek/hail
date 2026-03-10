@@ -81,7 +81,7 @@ uv run hail-po
 
 When running, you see initialization, market scanning, order placement, fill updates, and claim confirmations:
 
-![Sample execution logs](assets/sample-logs.png)
+<img width="1905" height="954" alt="image" src="https://github.com/user-attachments/assets/dc2aa1f8-ac9b-49c5-90a4-b530b8a0b697" />
 
 ## Config
 
